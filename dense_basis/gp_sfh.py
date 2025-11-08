@@ -1,301 +1,232 @@
+# priors.py
+# SED fitting priors and modeling assumptions, all in one place
+
 import numpy as np
-import sys
-import warnings
-warnings.filterwarnings('ignore')
+import matplotlib.pyplot as plt
+import corner
 
-import george
-from george import kernels
+# cosmology assumption
+from astropy.cosmology import FlatLambdaCDM
+cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 
-try:
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import DotProduct, RationalQuadratic
-except ImportError:
-    print("sklearn not available. The `gp_sklearn` interpolator will fail if chosen.")
+# this is the DB helper file (we’ll add continuity hooks there)
+from .gp_sfh import (
+    tuple_to_sfh,
+    make_continuity_agebins,
+    continuity_to_sfh,
+    calctimes,
+    calctimes_to_tuple,
+)
 
-from scipy.optimize import minimize
-from scipy.interpolate import PchipInterpolator, interp1d
-import scipy.io as sio
-
-from .priors import *
-
-import pkg_resources
-
-def get_file(folder, filename):
-    resource_package = __name__
-    resource_path = '/'.join((folder, filename))  # Do not use os.path.join()
-    template = pkg_resources.resource_stream(resource_package, resource_path)
-    return template
-
-fsps_mlc = sio.loadmat(get_file('train_data','fsps_mass_loss_curve.mat'))
-#fsps_mlc = sio.loadmat('dense_basis/train_data/fsps_mass_loss_curve.mat')
-fsps_time = fsps_mlc['timeax_fsps'].ravel()
-fsps_massloss = fsps_mlc['mass_loss_fsps'].ravel()
-
-# basic SFH tuples
-rising_sfh = np.array([10.0,1.0,3,0.5,0.7,0.9])
-regular_sfg_sfh = np.array([10.0,0.3,3,0.25,0.5,0.75])
-young_quenched_sfh = np.array([10.0,-1.0,3,0.3,0.6,0.8])
-old_quenched_sfh = np.array([10.0,-1.0,3,0.1,0.2,0.4])
-old_very_quenched_sfh = np.array([10.0,-10.0,3,0.1,0.2,0.4])
-double_peaked_SF_sfh = np.array([10.0,0.5,3,0.25,0.4,0.7])
-double_peaked_Q_sfh = np.array([10.0,-1.0,3,0.2,0.4,0.8])
+def quantile_names(N_params):
+    return (np.round(np.linspace(0, 100, N_params + 2)))[1:-1]
 
 
-def correct_for_mass_loss(sfh, time, mass_loss_curve_time, mass_loss_curve):
-    correction_factors = np.interp(time, mass_loss_curve_time, mass_loss_curve)
-    return sfh * correction_factors
+class Priors(object):
+    """ A class that holds prior information for SED fitting.
 
-# functions:
-def nll(p, gp, y):
-    gp.set_parameter_vector(p)
-    ll = gp.log_likelihood(y, quiet=True)
-    return -ll if np.isfinite(ll) else 1e25
+    NOTE: now supports TWO SFH families:
+        - sfh_type = 'gp'          (original DB behavior)
+        - sfh_type = 'continuity'  (ratios between time bins)
 
-def grad_nll(p, gp, y):
-    gp.set_parameter_vector(p)
-    return -gp.grad_log_likelihood(y, quiet=True)
+    For continuity, the user can provide:
+        - a fixed (N,2) array of bins: priors.set_continuity_agebins(...)
+        - OR a callable: priors.set_continuity_agebin_fn(lambda z: bins)
+    """
 
-#--------------------------------------------
+    def __init__(self):
+        # ----- mass -----
+        self.mass_max = 12.0
+        self.mass_min = 9.0
 
+        # ----- SFR / sSFR priors -----
+        self.sfr_prior_type = 'sSFRflat'  # SFRflat, sSFRflat, sSFRlognormal
+        self.sfr_max = -1.0
+        self.sfr_min = 2.0
+        self.ssfr_min = -12.0
+        self.ssfr_max = -7.5
+        self.ssfr_mean = 0.6
+        self.ssfr_sigma = 0.4
+        self.ssfr_shift = -0.3
 
-def gp_interpolator(x,y,res = 1000, Nparam = 3, decouple_sfr = False):
+        # ----- redshift -----
+        self.z_min = 0.9
+        self.z_max = 1.1
 
-    yerr = np.zeros_like(y)
-    yerr[2:(2+Nparam)] = 0.001/np.sqrt(Nparam)
-    if len(yerr) > 26:
-        yerr[2:(2+Nparam)] = 0.1/np.sqrt(Nparam)
-    if decouple_sfr == True:
-        yerr[(2+Nparam):] = 0.1
-    #if decouple_sfr == True:
-    #    yerr[-2:] = 0.1/np.sqrt(Nparam)
-    #else:
-    #    yerr[-2:] = 0.01/np.sqrt(Nparam)
+        # ----- metallicity -----
+        self.met_treatment = 'flat'  # or 'massmet'
+        self.Z_min = -1.5
+        self.Z_max = 0.25
+        self.massmet_width = 0.3
 
-    #kernel = np.var(yax) * kernels.ExpSquaredKernel(np.median(yax)+np.std(yax))
-    #k2 = np.var(yax) * kernels.LinearKernel(np.median(yax),order=1)
-    #kernel = np.var(y) * kernels.Matern32Kernel(np.median(y)) #+ k2
-    kernel = np.var(y) * (kernels.Matern32Kernel(np.median(y)) + kernels.LinearKernel(np.median(y), order=2))
-    gp = george.GP(kernel, solver=george.HODLRSolver)
+        # ----- dust -----
+        self.dust_model = 'Calzetti'
+        self.dust_prior = 'exp'
+        self.Av_min = 0.0
+        self.Av_max = 1.0
+        self.Av_exp_scale = 1.0 / 3.0
 
-    #print(xax.shape, yerr.shape)
-    gp.compute(x.ravel(), yerr.ravel())
+        # ----- original DB SFH controls -----
+        self.sfh_treatment = 'custom'  # or 'TNGlike'
+        self.tx_alpha = 5.0
+        self.Nparam = 3
+        self.decouple_sfr = False
+        self.decouple_sfr_time = 100  # in Myr
+        self.dynamic_decouple = True  # set decouple time according to z
 
-    # optimize kernel parameters
-#     p0 = gp.get_parameter_vector()
-#     results = minimize(nll, p0, jac=grad_nll, method="L-BFGS-B", args = (gp, y))
-#     gp.set_parameter_vector(results.x)
+        # ----- NEW: choose SFH family -----
+        self.sfh_type = 'gp'  # default = original DB
 
-    x_pred = np.linspace(np.amin(x), np.amax(x), res)
-    y_pred, pred_var = gp.predict(y.ravel(), x_pred, return_var=True)
+        # ----- continuity-specific -----
+        self.continuity_nbin = 7            # default number of time bins
+        self.continuity_df = 2.0            # student-t df for log ratios
+        self.continuity_scale = 0.3         # scale for log ratios
+        self.custom_agebins = None          # fixed (N,2) in Gyr
+        self.custom_agebin_fn = None        # callable: z -> (N,2)
 
-    return x_pred, y_pred
+    # ------------------------------------------------------------------
+    # basic priors
+    # ------------------------------------------------------------------
+    def sample_mass_prior(self, size=1):
+        massval = np.random.uniform(size=size) * (self.mass_max - self.mass_min) + self.mass_min
+        self.massval = massval
+        return massval
 
-def gp_sklearn_interpolator(x,y,res = 1000):
+    def sample_sfr_prior(self, zval=1.0, size=1):
+        if self.sfr_prior_type == 'SFRflat':
+            return np.random.uniform(size=size) * (self.sfr_max - self.sfr_min) + self.sfr_min
 
-    kernel = DotProduct(10.0, (1e-2,1e2)) *RationalQuadratic(0.1)
-    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=9)
-    gp.fit(x.reshape(-1,1),(y-x).reshape(-1,1))
+        elif self.sfr_prior_type == 'sSFRflat':
+            return np.random.uniform(size=size) * (self.ssfr_max - self.ssfr_min) + self.ssfr_min + self.massval
 
-    x_pred = np.linspace(0,1,1000)
-    y_pred, sigma = gp.predict(x_pred[:,np.newaxis], return_std=True)
-    y_pred = y_pred.ravel() + x_pred
+        elif self.sfr_prior_type == 'sSFRlognormal':
+            temp = np.random.lognormal(mean=self.ssfr_mean, sigma=self.ssfr_sigma, size=size)
+            temp = temp - np.exp(self.ssfr_mean)
+            temp = np.log10(10.0 / (cosmo.age(zval).value * 1e9)) - temp + self.ssfr_shift
+            sfrval = temp + self.massval
+            return sfrval
 
-    return x_pred, y_pred
-
-def linear_interpolator(x,y,res = 1000):
-
-    interpolator = interp1d(x,y)
-    x_pred = np.linspace(np.amin(x), np.amax(x), res)
-    y_pred = interpolator(x_pred)
-
-    return x_pred, y_pred
-
-def Pchip_interpolator(x,y,res = 1000):
-
-    interpolator = PchipInterpolator(x,y)
-    x_pred = np.linspace(np.amin(x), np.amax(x), res)
-    y_pred = interpolator(x_pred)
-
-    return x_pred, y_pred
-
-
-def tuple_to_sfh(sfh_tuple, zval, interpolator = 'gp_george', decouple_sfr = False, decouple_sfr_time = 10, sfr_tolerance = 0.05, vb = False,cosmo = cosmo, res = 1000, print_warnings = False):
-    # generate an SFH from an input tuple (Mass, SFR, {tx}) at a specified redshift
-
-
-    Nparam = int(sfh_tuple[2])
-    mass_quantiles = np.linspace(0,1,Nparam+2)
-    time_quantiles = np.zeros_like(mass_quantiles)
-    time_quantiles[-1] = 1
-    time_quantiles[1:-1] = sfh_tuple[3:]
-
-    # now add SFR constraints
-
-    # SFR smoothly increasing from 0 at the big bang
-    mass_quantiles = np.insert(mass_quantiles,1,[0.00])
-    time_quantiles = np.insert(time_quantiles,1,[0.01])
-
-    # SFR constrained to SFR_inst at the time of observation
-    #SFH_constraint_percentiles = np.array([0.96,0.97,0.98,0.99])
-    SFH_constraint_percentiles = np.array([0.97, 0.98, 0.99])
-    for const_vals in SFH_constraint_percentiles:
-
-        delta_mstar = 10**(sfh_tuple[0]) *(1-const_vals)
-        delta_t = 1 - delta_mstar/(10**sfh_tuple[1])/(cosmo.age(zval).value*1e9)
-
-        if (delta_t > time_quantiles[-2]) & (delta_t > 0.9):
-            mass_quantiles = np.insert(mass_quantiles, -1, [const_vals], )
-            time_quantiles = np.insert(time_quantiles, -1, [delta_t],)
         else:
-            delta_m = 1 - ((cosmo.age(zval).value*1e9)*(1-const_vals)*(10**sfh_tuple[1]))/(10**sfh_tuple[0])
-            time_quantiles = np.insert(time_quantiles, -1, [const_vals])
-            mass_quantiles=  np.insert(mass_quantiles, -1, [delta_m])
+            print('unknown SFR prior type. choose from SFRflat, sSFRflat, or sSFRlognormal.')
+            return np.nan
 
-    if interpolator == 'gp_george':
-        time_arr_interp, mass_arr_interp = gp_interpolator(time_quantiles, mass_quantiles, Nparam = int(Nparam), decouple_sfr = decouple_sfr, res=res)
-    elif interpolator == 'gp_sklearn':
-        time_arr_interp, mass_arr_interp = gp_sklearn_interpolator(time_quantiles, mass_quantiles)
-    elif interpolator == 'linear':
-        time_arr_interp, mass_arr_interp = linear_interpolator(time_quantiles, mass_quantiles)
-    elif interpolator == 'pchip':
-        time_arr_interp, mass_arr_interp = Pchip_interpolator(time_quantiles, mass_quantiles)
-    else:
-        raise Exception('specified interpolator does not exist: {}. \n use one of the following: gp_george, gp_sklearn, linear, and pchip '.format(interpolator))
+    def sample_z_prior(self, size=1):
+        zval = np.random.uniform(size=size) * (self.z_max - self.z_min) + self.z_min
+        self.zval = zval
+        return zval
 
-    sfh_scale = 10**(sfh_tuple[0])/(cosmo.age(zval).value*1e9/1000)
-    sfh = np.diff(mass_arr_interp)*sfh_scale
-    sfh[sfh<0] = 0
-    sfh = np.insert(sfh,0,[0])
+    def sample_Z_prior(self, size=1):
+        if self.met_treatment == 'flat':
+            return np.random.uniform(size=size) * (self.Z_max - self.Z_min) + self.Z_min
+        elif self.met_treatment == 'massmet':
+            met = (
+                np.random.normal(scale=self.massmet_width, size=size)
+                + (self.massval - 7) / (10.8 - 7)
+                - 1.0
+            )
+            return met
 
-    sfr_decouple_time_index = np.argmin(np.abs(time_arr_interp*cosmo.age(zval).value - decouple_sfr_time/1e3))
-    if sfr_decouple_time_index == 0:
-        sfr_decouple_time_index = 2
-    mass_lastbins = np.trapz(x=time_arr_interp[-sfr_decouple_time_index:]*1e9*(cosmo.age(zval).value), y=sfh[-sfr_decouple_time_index:])
-    mass_remaining = 10**(sfh_tuple[0]) - mass_lastbins
-    if mass_remaining < 0:
-        mass_remaining = 0
-        if print_warnings == True:
-            print('input SFR, M* combination is not physically consistent (log M*: %.2f, log SFR: %.2f.)' %(sfh_tuple[0],sfh_tuple[1]))
-    mass_initbins = np.trapz(x=time_arr_interp[0:(1000-sfr_decouple_time_index)]*1e9*(cosmo.age(zval).value), y=sfh[0:(1000-sfr_decouple_time_index)])
-    sfh[0:(1000-sfr_decouple_time_index)] = sfh[0:(1000-sfr_decouple_time_index)] * mass_remaining / mass_initbins
+    def sample_Av_prior(self, size=1):
+        if self.dust_model == 'Calzetti':
+            if self.dust_prior == 'flat':
+                return np.random.uniform(size=size) * (self.Av_max - self.Av_min) + self.Av_min
+            elif self.dust_prior == 'exp':
+                return np.random.exponential(size=size) * (self.Av_exp_scale)
+        # other dust models unchanged from original code
+        print('not currently coded up, please email me regarding this functionality.')
+        return np.zeros(size=size) * np.nan
 
-    if (np.abs(np.log10(sfh[-1]) - sfh_tuple[1]) > sfr_tolerance) or (decouple_sfr == True):
-        sfh[-sfr_decouple_time_index:] = 10**sfh_tuple[1]
+    # ------------------------------------------------------------------
+    # original DB / tx SFH
+    # ------------------------------------------------------------------
+    def sample_tx_prior(self, size=1):
+        if self.sfh_treatment == 'TNGlike':
+            # these are as in the original repo
+            tng_zvals = np.load(get_file('train_data/alpha_lookup_tables', 'tng_alpha_zvals.npy'))
+            tng_alphas = np.load(get_file('train_data/alpha_lookup_tables', 'tng_alpha_Nparam_%.0f.npy' % self.Nparam))
+            tng_best_z_index = np.argmin(np.abs(tng_zvals - self.zval))
+            self.tx_alpha = tng_alphas[0:, tng_best_z_index]
 
-#     if decouple_sfr == True:
-#         sfr_decouple_time_index = np.argmin(np.abs(time_arr_interp*cosmo.age(zval).value - decouple_sfr_time/1e3))
-#         sfh[-sfr_decouple_time_index:] = 10**sfh_tuple[1]
+        if size == 1:
+            temp_tx = np.cumsum(
+                np.random.dirichlet(np.ones((self.Nparam + 1,)) * self.tx_alpha, size=size)
+            )[0:-1]
+            return temp_tx
+        else:
+            temp_tx = np.cumsum(
+                np.random.dirichlet(np.ones((self.Nparam + 1,)) * self.tx_alpha, size=size),
+                axis=1
+            )[0:, 0:-1]
+            return temp_tx
 
-    timeax = time_arr_interp * cosmo.age(zval).value
+    def sample_sfh_tuple_gp(self):
+        sfh_tuple = np.zeros((self.Nparam + 3,))
+        sfh_tuple[0] = self.sample_mass_prior()
+        sfh_tuple[1] = self.sample_sfr_prior()
+        sfh_tuple[2] = self.Nparam
+        sfh_tuple[3:] = self.sample_tx_prior()
+        return sfh_tuple
 
-    if vb == True:
-        print('time and mass quantiles:')
-        print(time_quantiles, mass_quantiles)
-        plt.plot(time_quantiles, mass_quantiles,'--o')
-        plt.plot(time_arr_interp, mass_arr_interp)
-        plt.axis([0,1,0,1])
-        #plt.axis([0.9,1.05,0.9,1.05])
-        plt.show()
+    # ------------------------------------------------------------------
+    # continuity SFH
+    # ------------------------------------------------------------------
+    def set_continuity_agebins(self, agebins):
+        """
+        Set fixed time bins for continuity SFH.
+        agebins: (N, 2) array, lookback time in Gyr
+        """
+        agebins = np.asarray(agebins, float)
+        assert agebins.ndim == 2 and agebins.shape[1] == 2
+        self.custom_agebins = agebins
+        self.custom_agebin_fn = None
+        self.continuity_nbin = agebins.shape[0]
 
-        print('instantaneous SFR: %.1f' %sfh[-1])
-        plt.plot(np.amax(time_arr_interp) - time_arr_interp, sfh)
-        #plt.xscale('log')
-        plt.show()
+    def set_continuity_agebin_fn(self, fn):
+        """
+        Set a redshift-dependent binning:
+        fn(z) -> (N, 2) array in Gyr
+        """
+        self.custom_agebin_fn = fn
+        self.custom_agebins = None
 
-    return sfh, timeax
+    def sample_continuity_ratios(self, nbin=None):
+        if nbin is None:
+            nbin = self.continuity_nbin
+        raw = np.random.standard_t(df=self.continuity_df, size=nbin - 1)
+        return raw * self.continuity_scale
 
-def calctimes(timeax,sfh,nparams):
+    def sample_sfh_tuple_continuity(self):
+        # we may not know actual nbin if user gave a callable, so fall back
+        if self.custom_agebins is not None:
+            nbin = self.custom_agebins.shape[0]
+        else:
+            nbin = self.continuity_nbin
 
-    massint = np.cumsum(sfh)
-    massint_normed = massint/np.amax(massint)
-    tx = np.zeros((nparams,))
-    for i in range(nparams):
-        tx[i] = timeax[np.argmin(np.abs(massint_normed - 1*(i+1)/(nparams+1)))]
-        #tx[i] = (np.argmin(np.abs(massint_normed - 1*(i+1)/(nparams+1))))
-        #print(1*(i+1)/(nparams+1))
+        logM = self.sample_mass_prior()
+        log_sfr_ratios = self.sample_continuity_ratios(nbin=nbin)
 
-    #mass = np.log10(np.sum(sfh)*1e9)
-    mass = np.log10(np.trapz(sfh,timeax*1e9))
-    sfr = np.log10(sfh[-1])
+        sfh_tuple = np.zeros((2 + (nbin - 1),))
+        sfh_tuple[0] = logM
+        sfh_tuple[1] = nbin
+        sfh_tuple[2:] = log_sfr_ratios
+        return sfh_tuple
 
-    return mass, sfr, tx/np.amax(timeax)
+    # ------------------------------------------------------------------
+    # unified entry point
+    # ------------------------------------------------------------------
+    def sample_sfh_tuple(self):
+        if self.sfh_type == 'continuity':
+            return self.sample_sfh_tuple_continuity()
+        else:
+            return self.sample_sfh_tuple_gp()
 
-def calctimes_to_tuple(calctimelist):
-    nparam = len(calctimelist[2])
+    def sample_all_params(self, random_seed=np.random.randint(1)):
+        np.random.seed(random_seed)
+        temp_z = self.sample_z_prior()
+        sfh_tuple = self.sample_sfh_tuple()
+        temp_Z = self.sample_Z_prior()
+        temp_Av = self.sample_Av_prior()
+        return sfh_tuple, temp_Z, temp_Av, temp_z
 
-    sfhtuple = []
-    sfhtuple.append(calctimelist[0])
-    sfhtuple.append(calctimelist[1])
-    sfhtuple.append(nparam)
-    for i in range(nparam):
-        sfhtuple.append(calctimelist[2][i])
-    return sfhtuple
+    # rest of plotting helpers from your original file can stay unchanged
 
-def scale_t50(t50_val = 1.0, zval = 1.0):
-    """
-    Change a t50 value from lookback time in Gyr at a given redshift
-    to fraction of the age of the universe.
-
-    inputs: t50 [Gyr, lookback time], redshift
-    outputs: t50 [fraction of the age of the universe, cosmic time]
-    """
-
-    return (1 - t50_val/cosmo.age(zval).value)
-
-def scale_t50_inv(t50_val_frac = 1.0, zval = 1.0):
-    """
-    Change a t50 value from a fraction of the age of the universe to
-    lookback time in Gyr at a given redshift
-
-    inputs: t50 [fraction of the age of the universe, cosmic time], redshift
-    outputs: t50 [Gyr, lookback time]
-    """
-
-    return (1- t50_val_frac)*cosmo.age(zval).value
-
-
-### ALR add continuity SFH ###
-
-def continuity_to_sfh(zred, logmass, log_sfr_ratios, agebins, base_sfr=None):
-    nbin = len(agebins)
-    assert len(log_sfr_ratios) == nbin - 1
-
-    # 1. build SFRs in bins
-    sfr_bins = np.zeros(nbin, dtype=float)
-    if base_sfr is None:
-        sfr_bins[0] = 1.0
-    else:
-        sfr_bins[0] = base_sfr
-
-    for i in range(1, nbin):
-        sfr_bins[i] = sfr_bins[i-1] * np.exp(log_sfr_ratios[i-1])
-
-    widths_yr = (agebins[:, 1] - agebins[:, 0]) * 1e9
-    mform = sfr_bins * widths_yr
-
-    current_total = mform.sum()
-    target_total = 10**logmass
-    mform *= target_total / current_total
-    sfr_bins = mform / widths_yr
-
-    tmin = agebins[0, 0]
-    tmax = agebins[-1, 1]
-    timeax = np.linspace(tmin, tmax, 300)
-    sfr_t = np.zeros_like(timeax)
-    for i, (t0, t1) in enumerate(agebins):
-        sel = (timeax >= t0) & (timeax < t1)
-        sfr_t[sel] = sfr_bins[i]
-
-    return timeax, sfr_t, sfr_bins
-
-
-def tuple_to_sfh_dispatch(sfh_tuple, zval, sfh_type='gp'):
-    if sfh_type == 'continuity':
-        logmass = sfh_tuple[0]
-        nbin = int(sfh_tuple[2])
-        log_sfr_ratios = sfh_tuple[3:3+nbin-1]
-        agebins = make_continuity_agebins(zval, nbin)
-        timeax, sfr_t, _ = continuity_to_sfh(zval, logmass, log_sfr_ratios, agebins)
-        return sfr_t, timeax
-    else:
-        return tuple_to_sfh(sfh_tuple, zval=zval)
