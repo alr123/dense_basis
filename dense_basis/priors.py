@@ -87,6 +87,8 @@ class Priors(object):
         self.decouple_sfr_time = 100 # in Myr
         self.dynamic_decouple = True # set decouple time according to redshift (100 Myr at z=0.1)
 
+        self.sfh_type = 'continutity'
+
 
     def sample_mass_prior(self, size = 1):
         massval = np.random.uniform(size=size)*(self.mass_max-self.mass_min) + self.mass_min
