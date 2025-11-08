@@ -252,3 +252,38 @@ def scale_t50_inv(t50_val_frac = 1.0, zval = 1.0):
     """
 
     return (1- t50_val_frac)*cosmo.age(zval).value
+
+
+### ALR add continuity SFH ###
+
+def continuity_to_sfh(zred, logmass, log_sfr_ratios, agebins, base_sfr=None):
+    nbin = len(agebins)
+    assert len(log_sfr_ratios) == nbin - 1
+
+    # 1. build SFRs in bins
+    sfr_bins = np.zeros(nbin, dtype=float)
+    if base_sfr is None:
+        sfr_bins[0] = 1.0
+    else:
+        sfr_bins[0] = base_sfr
+
+    for i in range(1, nbin):
+        sfr_bins[i] = sfr_bins[i-1] * np.exp(log_sfr_ratios[i-1])
+
+    widths_yr = (agebins[:, 1] - agebins[:, 0]) * 1e9
+    mform = sfr_bins * widths_yr
+
+    current_total = mform.sum()
+    target_total = 10**logmass
+    mform *= target_total / current_total
+    sfr_bins = mform / widths_yr
+
+    tmin = agebins[0, 0]
+    tmax = agebins[-1, 1]
+    timeax = np.linspace(tmin, tmax, 300)
+    sfr_t = np.zeros_like(timeax)
+    for i, (t0, t1) in enumerate(agebins):
+        sel = (timeax >= t0) & (timeax < t1)
+        sfr_t[sel] = sfr_bins[i]
+
+    return timeax, sfr_t, sfr_bins
