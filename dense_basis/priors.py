@@ -10,8 +10,8 @@ cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 
 # this should now contain:
 # - tuple_to_sfh (existing DB)
-# - continuity_to_sfh (you added)
-# - make_continuity_agebins (you added)
+# - continuity_to_sfh 
+# - make_continuity_agebins 
 from .gp_sfh import *
 
 def quantile_names(N_params):
