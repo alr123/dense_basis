@@ -1,20 +1,24 @@
+# pre_grid.py
+
 import numpy as np
 from tqdm import tqdm
 import scipy.io as sio
 import os
 import pkg_resources
 import hickle
+import matplotlib.pyplot as plt  # original code used plt inside make_filvalkit_simple
 
 # cosmology assumption
 from astropy.cosmology import FlatLambdaCDM
 cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 
-from .priors import Priors
+from .priors import *
 from .gp_sfh import (
-    tuple_to_sfh,              # original DB
-    calctimes, calctimes_to_tuple,
-    continuity_to_sfh,         # you added this
-    make_continuity_agebins    # you added this
+    tuple_to_sfh,
+    calctimes,
+    calctimes_to_tuple,
+    continuity_to_sfh,
+    make_continuity_agebins,
 )
 
 try:
@@ -30,54 +34,89 @@ try:
         add_neb_emission=True
     )
     print('Starting dense_basis. please wait ~ a minute for the FSPS backend to initialize.')
+
 except Exception:
     mocksp = None
     print('Starting dense_basis. Failed to load FSPS, only GP-SFH module will be available.')
 
 priors = Priors()
 
-# -----------------------------------------------------------------------
+#-----------------------------------------------------------------------
 #                     Calculating spectra and SEDs
-# -----------------------------------------------------------------------
+#-----------------------------------------------------------------------
 
 def get_path(filename):
     return os.path.dirname(os.path.realpath(filename))
 
+
 def convert_to_microjansky(spec, z, cosmology):
-    """
-    Convert FSPS Lnu to Fnu in microJy
-    """
-    temp = (
-        (1 + z) * spec * 1e6 * 1e23 * 3.48e33 /
-        (4 * np.pi * 3.086e+24 * 3.086e+24 *
-         cosmology.luminosity_distance(z).value *
-         cosmology.luminosity_distance(z).value)
+    """Convert a spectrum in L_nu to F_nu (microJy)."""
+    temp = (1+z) * spec * 1e6 * 1e23 * 3.48e33 / (
+        4 * np.pi * 3.086e+24 * 3.086e+24 *
+        cosmology.luminosity_distance(z).value * cosmology.luminosity_distance(z).value
     )
     return temp
 
-def makespec_atlas(atlas, galid, priors, sp, cosmo, filter_list=[], filt_dir=[], return_spec=False):
+
+def _resolve_agebins_for_continuity(priors, zval, sfh_tuple, custom_agebins=None):
+    """
+    Decide which agebins to use for a continuity SFH:
+    priority:
+      1. explicit custom_agebins passed to generate_atlas / makespec
+      2. priors.custom_agebin_fn(z)
+      3. priors.custom_agebins
+      4. fall back to equal-width bins from 0 → age(z)
+    """
+    if custom_agebins is not None:
+        return np.asarray(custom_agebins, float)
+
+    # callable on the priors
+    if hasattr(priors, "custom_agebin_fn") and priors.custom_agebin_fn is not None:
+        return np.asarray(priors.custom_agebin_fn(zval), float)
+
+    # fixed array on the priors
+    if hasattr(priors, "custom_agebins") and priors.custom_agebins is not None:
+        return np.asarray(priors.custom_agebins, float)
+
+    # last resort: infer nbin from sfh_tuple
+    # continuity tuple is: [logM, nbin, log_ratio_0, ...]
+    nbin = int(sfh_tuple[1])
+    return make_continuity_agebins(zval, nbin)
+
+
+def makespec_atlas(atlas, galid, priors, sp, cosmo,
+                   filter_list=[], filt_dir=[], return_spec=False,
+                   custom_agebins=None):
     sfh_tuple = atlas['sfh_tuple'][galid, 0:]
     zval = atlas['zval'][galid]
     dust = atlas['dust'][galid]
     met = atlas['met'][galid]
 
     specdetails = [sfh_tuple, dust, met, zval]
-    if priors.dynamic_decouple and priors.sfh_type != "continuity":
+    if priors.dynamic_decouple is True and getattr(priors, "sfh_type", "gp") != "continuity":
         priors.decouple_sfr_time = 100 * cosmo.age(zval).value / cosmo.age(0.1).value
 
-    output = makespec(specdetails, priors, sp, cosmo, filter_list, filt_dir, return_spec)
+    output = makespec(
+        specdetails, priors, sp, cosmo,
+        filter_list, filt_dir,
+        return_spec=return_spec,
+        custom_agebins=custom_agebins
+    )
+
     return output
+
 
 def make_colours(specdetails, sp, cosmo):
     """
     generate standard rest frame colours (UV,VJ,NUVr,rJ, NUVU) using FSPS
     """
+
     sp.params['zred'] = 0
 
-    sfh_tuple, dust, met, zval = specdetails
+    sfh_tuple, dust, met, zval = specdetails  # redshift of model
 
     if np.isnan(zval):
-        rest_nuv = rest_r = rest_u = rest_v = rest_j = -99
+        rest_nuv, rest_r, rest_u, rest_v, rest_j = -99, -99, -99, -99, -99
     else:
         rest_nuv, rest_r, rest_u, rest_v, rest_j = sp.get_mags(
             tage=cosmo.age(zval).value,
@@ -92,18 +131,18 @@ def make_colours(specdetails, sp, cosmo):
 
     return nuvu, nuvr, uv, vj, rj
 
-def makespec(
-    specdetails, priors, sp, cosmo,
-    filter_list=[], filt_dir=[], return_spec=False,
-    peraa=False, input_sfh=False
-):
+
+def makespec(specdetails, priors, sp, cosmo,
+             filter_list=[], filt_dir=[], return_spec=False,
+             peraa=False, input_sfh=False,
+             custom_agebins=None):
     """
-    makespec() works in two ways to create spectra or SEDs.
+    makespec() works in two ways to create spectra or SEDs from an input list of physical paramters.
     with input_sfh = False, specdetails = [sfh_tuple, dust, met, zval]
-    with input_sfh = True,  specdetails = [sfh, timeax, dust, met, zval]
+    with input_sfh = True, specdetails = [sfh, timeax, dust, met, zval]
     """
 
-    # hardcoded FSPS params
+    # hardcoded parameters
     sp.params['sfh'] = 3
     sp.params['cloudy_dust'] = True
     sp.params['gas_logu'] = -2
@@ -112,16 +151,19 @@ def makespec(
     sp.params['add_neb_continuum'] = True
     sp.params['imf_type'] = 1  # Chabrier
 
-    if input_sfh:
+    # variable parameters
+    if input_sfh is True:
         [sfh, timeax, dust, met, zval] = specdetails
     else:
         [sfh_tuple, dust, met, zval] = specdetails
 
-        # ---- branch on SFH family ----
-        if priors.sfh_type == "continuity":
-            nbin = int(sfh_tuple[1])
+        # branch: continuity SFH vs original DB SFH
+        if getattr(priors, "sfh_type", "gp") == "continuity":
+            agebins = _resolve_agebins_for_continuity(
+                priors, zval, sfh_tuple, custom_agebins=custom_agebins
+            )
+            nbin = agebins.shape[0]
             log_sfr_ratios = sfh_tuple[2:2 + nbin - 1]
-            agebins = make_continuity_agebins(zval, nbin)
             timeax, sfh, _ = continuity_to_sfh(
                 zred=zval,
                 logmass=sfh_tuple[0],
@@ -138,40 +180,48 @@ def makespec(
     sp.set_tabular_sfh(timeax, sfh)
     sp.params['dust2'] = dust
     sp.params['logzsol'] = met
-    sp.params['gas_logz'] = met  # match stellar and gas metallicity
+    sp.params['gas_logz'] = met  # matching stellar to gas-phase metallicity
     sp.params['zred'] = zval
 
-    lam, spec = sp.get_spectrum(
-        tage=cosmo.age(zval).value + 1e-4,
-        peraa=peraa
-    )
+    # adding 0.1 Myr here to get the last couple of FSPS SSPs
+    lam, spec = sp.get_spectrum(tage=cosmo.age(zval).value + 1e-4, peraa=peraa)
     spec_ujy = convert_to_microjansky(spec, zval, cosmo)
 
-    if isinstance(return_spec, bool):
-        if return_spec:
+    if type(return_spec) == type(True):
+        if return_spec is True:
             return lam, spec_ujy
-        else:
+        elif return_spec is False:
             filcurves, _, _ = make_filvalkit_simple(
                 lam, zval,
-                fkit_name=filter_list, filt_dir=filt_dir
+                fkit_name=filter_list,
+                filt_dir=filt_dir
             )
             sed = calc_fnu_sed_fast(spec_ujy, filcurves)
             return sed
+
     elif len(return_spec) > 10:
         return convert_to_splined_spec(spec, lam, return_spec, zval)
+
     else:
-        raise ValueError('Unknown argument for return_spec. Use True or False, or pass a wavelength grid.')
+        raise ('Unknown argument for return_spec. Use True or False, or pass a wavelength grid.')
+
+    return 0
+
 
 def convert_to_splined_spec(spec_peraa, lam, lam_spline, redshift, cosmology=cosmo):
+
     spec = spec_peraa
     spec_ergsec = spec * 3.839e33 * 1e17 / (1 + redshift)
     lum_dist = cosmology.luminosity_distance(redshift).value
-    spec_ergsec_cm2 = spec_ergsec / (4 * np.pi * 3.086e+24 * 3.086e+24 * lum_dist * lum_dist)
-    spec_spline = np.interp(lam_spline, lam * (1 + redshift), spec_ergsec_cm2)
+    spec_ergsec_cm2 = spec_ergsec / (4*np.pi*3.086e+24*3.086e+24*lum_dist*lum_dist)
+    spec_spline = np.interp(lam_spline, lam*(1+redshift), spec_ergsec_cm2)
     return spec_spline
 
-def make_sed_fast(sfh_tuple, metval, dustval, zval, filcurves,
-                  igmval=True, return_lam=False, sp=mocksp, cosmology=cosmo):
+
+def make_sed_fast(sfh_tuple, metval, dustval, zval,
+                  filcurves, igmval=True, return_lam=False,
+                  sp=mocksp, cosmology=cosmo):
+
     spec, logsfr, logmstar = make_spec(
         sfh_tuple, metval, dustval, zval,
         igmval=True, return_ms=True, return_lam=False,
@@ -180,8 +230,10 @@ def make_sed_fast(sfh_tuple, metval, dustval, zval, filcurves,
     sed = calc_fnu_sed_fast(spec, filcurves)
     return sed, logsfr, logmstar
 
+
 def make_filvalkit_simple(lam, z, fkit_name='filter_list.dat', vb=False, filt_dir='filters/'):
-    lam_z = (1 + z) * lam
+
+    lam_z = (1+z)*lam
     lam_z_lores = np.arange(2000, 150000, 2000)
 
     if filt_dir == 'internal':
@@ -191,13 +243,13 @@ def make_filvalkit_simple(lam, z, fkit_name='filter_list.dat', vb=False, filt_di
         temp = template.split()
     else:
         if filt_dir[-1] == '/':
-            f = open(filt_dir + fkit_name, 'r')
+            f = open(filt_dir+fkit_name, 'r')
         else:
-            f = open(filt_dir + '/' + fkit_name, 'r')
+            f = open(filt_dir+'/'+fkit_name, 'r')
         temp = f.readlines()
 
-    if vb:
-        print('number of filters to be read in: ' + str(len(temp)))
+    if vb is True:
+        print('number of filters to be read in: '+str(len(temp)))
 
     numlines = len(temp)
     if temp[-1] == '\n':
@@ -206,20 +258,20 @@ def make_filvalkit_simple(lam, z, fkit_name='filter_list.dat', vb=False, filt_di
     filcurves = np.zeros((len(lam_z), numlines))
     filcurves_lores = np.zeros((len(lam_z_lores), numlines))
 
-    if vb:
-        import matplotlib.pyplot as plt
+    if vb is True:
         plt.figure(figsize=(12, 6))
 
     for i in range(numlines):
-        if (filt_dir == 'internal') and (fkit_name == 'filter_list_goodss.dat'):
+
+        if (filt_dir == 'internal') & (fkit_name == 'filter_list_goodss.dat'):
             tempfilt = np.loadtxt(get_file('filters/filter_curves/goods_s', temp[i][22:].decode("utf-8")))
-        elif (filt_dir == 'internal') and (fkit_name == 'filter_list_goodsn.dat'):
+        elif (filt_dir == 'internal') & (fkit_name == 'filter_list_goodsn.dat'):
             tempfilt = np.loadtxt(get_file('filters/filter_curves/goods_n', temp[i][22:].decode("utf-8")))
-        elif (filt_dir == 'internal') and (fkit_name == 'filter_list_cosmos.dat'):
+        elif (filt_dir == 'internal') & (fkit_name == 'filter_list_cosmos.dat'):
             tempfilt = np.loadtxt(get_file('filters/filter_curves/cosmos', temp[i][21:].decode("utf-8")))
-        elif (filt_dir == 'internal') and (fkit_name == 'filter_list_egs.dat'):
+        elif (filt_dir == 'internal') & (fkit_name == 'filter_list_egs.dat'):
             tempfilt = np.loadtxt(get_file('filters/filter_curves/egs', temp[i][18:].decode("utf-8")))
-        elif (filt_dir == 'internal') and (fkit_name == 'filter_list_uds.dat'):
+        elif (filt_dir == 'internal') & (fkit_name == 'filter_list_uds.dat'):
             tempfilt = np.loadtxt(get_file('filters/filter_curves/uds', temp[i][18:].decode("utf-8")))
         else:
             if filt_dir[-1] == '/':
@@ -234,34 +286,36 @@ def make_filvalkit_simple(lam, z, fkit_name='filter_list.dat', vb=False, filt_di
                 else:
                     raise Exception('filters not found. are you sure the folder exists at the right relative path?')
 
-        temp_lam_arr = tempfilt[:, 0]
-        temp_response_curve = tempfilt[:, 1]
+        temp_lam_arr = tempfilt[0:, 0]
+        temp_response_curve = tempfilt[0:, 1]
 
         bot_in = np.argmin(np.abs(lam_z - np.amin(temp_lam_arr)))
         top_in = np.argmin(np.abs(lam_z - np.amax(temp_lam_arr)))
 
         curve_small = np.interp(lam_z[bot_in+1:top_in-1], temp_lam_arr, temp_response_curve)
-        splinedcurve = np.zeros(lam_z.shape)
+        splinedcurve = np.zeros((lam_z.shape))
         splinedcurve[bot_in+1:top_in-1] = curve_small
         if np.amax(splinedcurve) > 1:
             splinedcurve = splinedcurve / np.amax(splinedcurve)
 
-        filcurves[:, i] = splinedcurve
+        filcurves[0:, i] = splinedcurve
 
-        if vb:
-            plt.plot(np.log10(lam_z), splinedcurve, 'k--', label=filt_name[0:-1])
+        if vb is True:
+            plt.plot(np.log10(lam_z), splinedcurve, 'k--', label=filt_name[0:][0:-1])
 
     if (filt_dir != 'internal'):
         f.close()
 
-    if vb:
+    if vb is True:
+        print('created filcurve array splined to input lambda array at redshift: '+str(z))
         plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-        plt.xlabel(r'log $\lambda [\AA]$')
+        plt.xlabel(r'log $\lambda [\AA]$', fontsize=18)
         plt.ylabel('Filter transmission')
         plt.axis([3.5, 5, 0, 1])
         plt.show()
 
     return filcurves, lam_z, lam_z_lores
+
 
 def calc_fnu_sed(spec, z, lam, fkit_name='filter_list.dat', filt_dir='filters/'):
     filcurves, lam_z, lam_z_lores = make_filvalkit_simple(
@@ -270,37 +324,52 @@ def calc_fnu_sed(spec, z, lam, fkit_name='filter_list.dat', filt_dir='filters/')
     fnuspec = spec
     filvals = np.zeros((filcurves.shape[1],))
     for tindex in range(filcurves.shape[1]):
-        temp1 = filcurves[np.where(filcurves[:, tindex] > 0), tindex]
-        temp2 = fnuspec[np.where(filcurves[:, tindex] > 0)]
-        filvals[tindex] = np.sum(temp1.T[:, 0] * temp2) / np.sum(filcurves[:, tindex])
+        temp1 = filcurves[np.where(filcurves[0:, tindex] > 0), tindex]
+        temp2 = fnuspec[np.where(filcurves[0:, tindex] > 0)]
+        filvals[tindex] = np.sum(temp1.T[0:, 0] * temp2) / np.sum(filcurves[0:, tindex])
     return filvals
+
 
 def calc_fnu_sed_fast(fnuspec, filcurves):
     filvals = np.zeros((filcurves.shape[1],))
     for tindex in range(filcurves.shape[1]):
-        temp1 = filcurves[np.where(filcurves[:, tindex] > 0), tindex]
-        temp2 = fnuspec[np.where(filcurves[:, tindex] > 0)]
-        filvals[tindex] = np.sum(temp1.T[:, 0] * temp2) / np.sum(filcurves[:, tindex])
+        temp1 = filcurves[np.where(filcurves[0:, tindex] > 0), tindex]
+        temp2 = fnuspec[np.where(filcurves[0:, tindex] > 0)]
+        filvals[tindex] = np.sum(temp1.T[0:, 0] * temp2) / np.sum(filcurves[0:, tindex])
     return filvals
 
-def generate_atlas(
-    N_pregrid=10, priors=priors, initial_seed=42, store=True,
-    filter_list='filter_list.dat', filt_dir='filters/', norm_method='median',
-    z_step=0.01, sp=mocksp, cosmology=cosmo, fname=None, path='pregrids/',
-    lam_array_spline=[], rseed=None
-):
-    """
-    Generate a pregrid of galaxy properties and their corresponding SEDs.
-    Now works for both gp and continuity SFHs.
-    """
 
-    print('generating atlas with:')
-    print('  SFH type:', priors.sfh_type)
-    print('  SFR sampling:', priors.sfr_prior_type)
-    print('  SFH treatment:', priors.sfh_treatment)
-    print('  met sampling:', priors.met_treatment)
-    print('  dust:', priors.dust_model, priors.dust_prior)
-    print('  decouple SFR:', priors.decouple_sfr)
+def generate_atlas(
+    N_pregrid=10,
+    priors=priors,
+    initial_seed=42,
+    store=True,
+    filter_list='filter_list.dat',
+    filt_dir='filters/',
+    norm_method='median',
+    z_step=0.01,
+    sp=mocksp,
+    cosmology=cosmo,
+    fname=None,
+    path='pregrids/',
+    lam_array_spline=[],
+    rseed=None,
+    custom_agebins=None
+):
+    """Generate a pregrid of galaxy properties and their corresponding SEDs."""
+
+    print('generating atlas with: ')
+    # this line stays very similar to the original to preserve logging
+    print(
+        getattr(priors, "Nparam", "—"), ' tx parameters, ',
+        priors.sfr_prior_type, ' SFR sampling',
+        getattr(priors, "sfh_treatment", 'custom'), ' SFH treatment',
+        priors.met_treatment, ' met sampling',
+        priors.dust_model, ' dust attenuation',
+        priors.dust_prior, ' dust prior',
+        priors.decouple_sfr, ' SFR decoupling.',
+        'SFH family:', getattr(priors, "sfh_type", "gp")
+    )
 
     if rseed is not None:
         print('setting random seed to :', rseed)
@@ -321,33 +390,27 @@ def generate_atlas(
     rj_all = []
     nuvr_all = []
 
-    # filter grids: build once
+    # for speed
     fcs = None
     fc_zgrid = None
 
     for i in tqdm(range(int(N_pregrid))):
 
-        # draw everything at once (works for gp and continuity)
+        # --- sample from priors (this already picks gp vs continuity) ---
         sfh_tuple, met, dust, zval = priors.sample_all_params(
-            random_seed=initial_seed + i * 7
+            random_seed=initial_seed + i*7
         )
 
-        # for gp: adjust decouple time
-        if priors.dynamic_decouple and priors.sfh_type != "continuity":
+        # for original DB behaviour, update decouple time
+        if priors.dynamic_decouple is True and getattr(priors, "sfh_type", "gp") != "continuity":
             priors.decouple_sfr_time = 100 * cosmo.age(zval).value / cosmo.age(0.1).value
 
-        # for bookkeeping: reconstruct SFH (or just keep tuple for continuity)
-        if priors.sfh_type == "continuity":
-            nbin = int(sfh_tuple[1])
-            agebins = make_continuity_agebins(zval, nbin)
-            timeax, sfh, _ = continuity_to_sfh(
-                zred=zval,
-                logmass=sfh_tuple[0],
-                log_sfr_ratios=sfh_tuple[2:2 + nbin - 1],
-                agebins=agebins
-            )
-            temptuple = sfh_tuple.copy()  # we can just store original
+        # --- build an SFH to recover tx (for gp) ---
+        if getattr(priors, "sfh_type", "gp") == "continuity":
+            # we'll just keep the tuple as-is; no reconstructed tuple
+            temptuple = sfh_tuple.copy()
         else:
+            # run through original tuple_to_sfh and then recover tx
             sfh, timeax = tuple_to_sfh(
                 sfh_tuple, zval,
                 decouple_sfr=priors.decouple_sfr,
@@ -356,45 +419,53 @@ def generate_atlas(
             temp = calctimes(timeax, sfh, priors.Nparam)
             temptuple = calctimes_to_tuple(temp)
 
+        # --- SED / spectrum ---
         specdetails = [sfh_tuple, dust, met, zval]
 
-        # make SED
         if len(lam_array_spline) > 0:
             sed = makespec(
                 specdetails, priors, sp, cosmology,
                 filter_list, filt_dir,
-                return_spec=lam_array_spline, peraa=True
+                return_spec=lam_array_spline,
+                peraa=True,
+                custom_agebins=custom_agebins
             )
         else:
             lam, spec_ujy = makespec(
                 specdetails, priors, sp, cosmology,
-                filter_list, filt_dir, return_spec=True
+                filter_list, filt_dir,
+                return_spec=True,
+                custom_agebins=custom_agebins
             )
 
             if i == 0:
                 fc_zgrid = np.arange(priors.z_min - z_step, priors.z_max + z_step, z_step)
                 temp_fc, temp_lz, temp_lz_lores = make_filvalkit_simple(
                     lam, priors.z_min,
-                    fkit_name=filter_list, filt_dir=filt_dir
+                    fkit_name=filter_list,
+                    filt_dir=filt_dir
                 )
                 fcs = np.zeros((temp_fc.shape[0], temp_fc.shape[1], len(fc_zgrid)))
-                for j, zfc in enumerate(fc_zgrid):
+                for j in range(len(fc_zgrid)):
                     fcs[:, :, j], _, _ = make_filvalkit_simple(
-                        lam, zfc,
-                        fkit_name=filter_list, filt_dir=filt_dir
+                        lam, fc_zgrid[j],
+                        fkit_name=filter_list,
+                        filt_dir=filt_dir
                     )
 
             fc_index = np.argmin(np.abs(zval - fc_zgrid))
             sed = calc_fnu_sed_fast(spec_ujy, fcs[:, :, fc_index])
 
-        # normalization
+        # --- normalization ---
         if norm_method == 'none':
             norm_fac = 1
         elif norm_method == 'max':
-            norm_fac = np.nanmax(sed)
+            norm_fac = np.amax(sed)
         elif norm_method == 'median':
             norm_fac = np.nanmedian(sed)
         elif norm_method == 'area':
+            # normalize SFH to 10^9 Msun
+            # in original code this line had a ==, keep behaviour but fix to =
             norm_fac = 10 ** (sfh_tuple[0] - 9)
         else:
             raise ValueError('undefined normalization argument')
@@ -402,25 +473,30 @@ def generate_atlas(
         sed = sed / norm_fac
         norm = 1.0 / norm_fac
 
+        # FSPS masses/SFRs
         mstar = np.log10(sp.stellar_mass / norm_fac)
         sfr = np.log10(sp.sfr / norm_fac)
 
-        # adjust tuple for normalization:
+        # renormalize tuples
         sfh_tuple_normed = sfh_tuple.copy()
         sfh_tuple_normed[0] = sfh_tuple_normed[0] - np.log10(norm_fac)
-        if priors.sfh_type != "continuity":
-            # gp version has logSFR at index 1
+        # continuity tuples don't have instantaneous SFR, so guard
+        if getattr(priors, "sfh_type", "gp") != "continuity" and len(sfh_tuple_normed) > 1:
             sfh_tuple_normed[1] = sfh_tuple_normed[1] - np.log10(norm_fac)
 
-        temptuple_normed = temptuple.copy()
-        if len(temptuple_normed) > 1:
+        temptuple_normed = np.array(temptuple).copy()
+        if len(temptuple_normed) > 0:
             temptuple_normed[0] = temptuple_normed[0] - np.log10(norm_fac)
-            if priors.sfh_type != "continuity":
-                temptuple_normed[1] = temptuple_normed[1] - np.log10(norm_fac)
+        if getattr(priors, "sfh_type", "gp") != "continuity" and len(temptuple_normed) > 1:
+            temptuple_normed[1] = temptuple_normed[1] - np.log10(norm_fac)
 
-        # colours
-        nuvu, nuvr, uv, vj, rj = make_colours(specdetails, sp, cosmo)
+        # calculate rest frame colours
+        try:
+            nuvu, nuvr, uv, vj, rj = make_colours(specdetails, sp, cosmo)
+        except Exception:
+            nuvu = nuvr = uv = vj = rj = np.nan
 
+        # --- append ---
         zval_all.append(zval)
         sfh_tuple_all.append(sfh_tuple_normed)
         sfh_tuple_rec_all.append(temptuple_normed)
@@ -436,21 +512,21 @@ def generate_atlas(
         vj_all.append(vj)
         rj_all.append(rj)
 
-    # pad variable-length tuples
-    maxlen_tuple = max(len(x) for x in sfh_tuple_all)
-    sfh_tuple_arr = np.full((len(sfh_tuple_all), maxlen_tuple), np.nan)
-    for i, arr in enumerate(sfh_tuple_all):
-        sfh_tuple_arr[i, :len(arr)] = arr
+    # original code assumes fixed-length tuples; now we may have variable-length
+    maxlen = max(len(t) for t in sfh_tuple_all)
+    sfh_tuple_arr = np.full((len(sfh_tuple_all), maxlen), np.nan)
+    for i, t in enumerate(sfh_tuple_all):
+        sfh_tuple_arr[i, :len(t)] = t
 
-    maxlen_rec = max(len(x) for x in sfh_tuple_rec_all)
+    maxlen_rec = max(len(t) for t in sfh_tuple_rec_all)
     sfh_tuple_rec_arr = np.full((len(sfh_tuple_rec_all), maxlen_rec), np.nan)
-    for i, arr in enumerate(sfh_tuple_rec_all):
-        sfh_tuple_rec_arr[i, :len(arr)] = arr
+    for i, t in enumerate(sfh_tuple_rec_all):
+        sfh_tuple_rec_arr[i, :len(t)] = t
 
     pregrid_dict = {
         'zval': np.array(zval_all),
-        'sfh_tuple': sfh_tuple_arr,
-        'sfh_tuple_rec': sfh_tuple_rec_arr,
+        'sfh_tuple': np.array(sfh_tuple_arr),
+        'sfh_tuple_rec': np.array(sfh_tuple_rec_arr),
         'norm': np.array(norm_all),
         'norm_method': norm_method,
         'mstar': np.array(mstar_all),
@@ -463,39 +539,56 @@ def generate_atlas(
         'uv': np.array(uv_all),
         'vj': np.array(vj_all),
         'rj': np.array(rj_all),
-        'sfh_type': priors.sfh_type,
-        'continuity_nbin': getattr(priors, 'continuity_nbin', None)
+        'sfh_type': getattr(priors, "sfh_type", "gp"),
     }
 
-    if store:
+    if store is True:
+
         if fname is None:
             fname = 'sfh_pregrid_size'
 
-        # pick a sensible suffix for filename
-        if priors.sfh_type == "continuity":
-            suffix = priors.continuity_nbin
+        # pick something sensible for the filename suffix
+        if getattr(priors, "sfh_type", "gp") == "continuity":
+            # try to read how many bins we actually used
+            if custom_agebins is not None:
+                suffix = custom_agebins.shape[0]
+            elif hasattr(priors, "custom_agebins") and priors.custom_agebins is not None:
+                suffix = priors.custom_agebins.shape[0]
+            else:
+                suffix = int(sfh_tuple_arr.shape[1] - 1)  # rough
         else:
             suffix = priors.Nparam
 
-        if not os.path.exists(path):
+        if os.path.exists(path):
+            print('Path exists. Saved atlas at : ' + path + fname + '_' + str(N_pregrid) + '_Nparam_' + str(suffix) + '.dbatlas')
+        else:
             os.mkdir(path)
-            print('Created directory and saved atlas at : ' + path)
-        outname = f"{path}{fname}_{N_pregrid}_Nparam_{suffix}.dbatlas"
-        print('Saved atlas at : ' + outname)
+            print('Created directory and saved atlas at : ' + path + fname + '_' + str(N_pregrid) + '_Nparam_' + str(suffix) + '.dbatlas')
         try:
-            hickle.dump(pregrid_dict, outname,
-                        compression='gzip', compression_opts=9)
+            hickle.dump(
+                pregrid_dict,
+                path + fname + '_' + str(N_pregrid) + '_Nparam_' + str(suffix) + '.dbatlas',
+                compression='gzip', compression_opts=9
+            )
         except Exception:
             print('storing without compression')
-            hickle.dump(pregrid_dict, outname)
+            hickle.dump(
+                pregrid_dict,
+                path + fname + '_' + str(N_pregrid) + '_Nparam_' + str(suffix) + '.dbatlas'
+            )
+
         return
 
     return pregrid_dict
 
+
 def load_atlas(fname, N_pregrid, N_param, path='pregrids/'):
+
     fname_full = path + fname + '_' + str(N_pregrid) + '_Nparam_' + str(N_param) + '.dbatlas'
     cat = hickle.load(fname_full)
     return cat
 
+
 def quantile_names(N_params):
     return (np.round(np.linspace(0, 100, N_params + 2)))[1:-1]
+
