@@ -287,3 +287,15 @@ def continuity_to_sfh(zred, logmass, log_sfr_ratios, agebins, base_sfr=None):
         sfr_t[sel] = sfr_bins[i]
 
     return timeax, sfr_t, sfr_bins
+
+
+def tuple_to_sfh_dispatch(sfh_tuple, zval, sfh_type='gp'):
+    if sfh_type == 'continuity':
+        logmass = sfh_tuple[0]
+        nbin = int(sfh_tuple[2])
+        log_sfr_ratios = sfh_tuple[3:3+nbin-1]
+        agebins = make_continuity_agebins(zval, nbin)
+        timeax, sfr_t, _ = continuity_to_sfh(zval, logmass, log_sfr_ratios, agebins)
+        return sfr_t, timeax
+    else:
+        return tuple_to_sfh(sfh_tuple, zval=zval)
