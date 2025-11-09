@@ -1,136 +1,272 @@
+# parallelization.py
+
+import os
+import time
+import glob
+import numpy as np
+
 try:
     from schwimmbad import SerialPool, MultiPool
     from functools import partial
-except:
+except Exception:
     print('running without parallelization.')
-import numpy as np
-import os
-import time
+    MultiPool = None
+    from functools import partial
 
+import hickle
 from astropy.table import Table
-import time
 import pylab as pl
 from IPython import display
 
-from .gp_sfh import *
-from .sed_fitter import *
-from .pre_grid import *
-from .priors import *
+from .pre_grid import generate_atlas
+from .sed_fitter import evaluate_sed_likelihood, get_quants
+from .priors import Priors
 
 
+# ---------------------------------------------------------------------
+# helpers for padding variable-length 2D arrays
+# ---------------------------------------------------------------------
+def _vstack_pad(a, b, fill=np.nan):
+    """
+    Stack two 2D arrays with possibly different column counts
+    by padding the smaller one with `fill`.
+    """
+    a = np.asarray(a)
+    b = np.asarray(b)
+
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    if b.ndim == 1:
+        b = b.reshape(1, -1)
+
+    na, ma = a.shape
+    nb, mb = b.shape
+    m = max(ma, mb)
+
+    a_pad = np.full((na, m), fill)
+    b_pad = np.full((nb, m), fill)
+    a_pad[:, :ma] = a
+    b_pad[:, :mb] = b
+    return np.vstack((a_pad, b_pad))
+
+
+# ---------------------------------------------------------------------
+# chunk generator
+# ---------------------------------------------------------------------
 def gen_pg_parallel(data_i, atlas_vals):
     """
     Generate the i-th chunk in parallel
     """
-
     fname, priors, pg_folder, filter_list, filt_dir, N_pregrid = atlas_vals
-    fname_full = fname + '_chunk_%.0f' %(data_i)
+    fname_full = f"{fname}_chunk_{data_i}"
 
-    generate_atlas(N_pregrid = N_pregrid,
-                          priors = priors,
-                          fname = fname_full, store=True, path=pg_folder,
-                          filter_list = filter_list, filt_dir = filt_dir,
-                          rseed = (N_pregrid * data_i + 1))
+    generate_atlas(
+        N_pregrid=N_pregrid,
+        priors=priors,
+        fname=fname_full,
+        store=True,
+        path=pg_folder,
+        filter_list=filter_list,
+        filt_dir=filt_dir,
+        rseed=(N_pregrid * data_i + 1),
+    )
     return
 
-def generate_atlas_in_parallel_chunking(chunksize, nchunks, fname = 'temp_parallel_atlas', filter_list = 'filter_list_goodss.dat', filt_dir = 'internal', priors = [], pg_folder = 'pregrids/'):
-    """
-    Generate chunks of an atlas in parallel and combine them into one big atlas
-    """
 
-    chunk_path = pg_folder+'atlaschunks/'
+def generate_atlas_in_parallel_chunking(
+    chunksize,
+    nchunks,
+    fname='temp_parallel_atlas',
+    filter_list='filter_list_goodss.dat',
+    filt_dir='internal',
+    priors=None,
+    pg_folder='pregrids/',
+):
+    """
+    Generate chunks of an atlas in parallel and combine them into one big atlas.
+    Works for both gp-style and continuity-style priors.
+    """
+    if priors is None:
+        priors = Priors()
+
+    chunk_path = os.path.join(pg_folder, 'atlaschunks')
     store_path = pg_folder
 
+    os.makedirs(chunk_path, exist_ok=True)
 
     atlas_vals = [fname, priors, chunk_path, filter_list, filt_dir, chunksize]
 
     time_start = time.time()
     data = np.arange(nchunks)
 
-    try:
-        with MultiPool() as pool:
-            values = list(pool.map(partial(gen_pg_parallel, atlas_vals = atlas_vals), data))
-    finally:
-        print('Generated pregrid (%.0f chunks, %.0f sedsperchunk)')
-        print('time taken: %.2f mins.' %((time.time()-time_start)/60))
+    if MultiPool is not None:
+        try:
+            with MultiPool() as pool:
+                list(pool.map(partial(gen_pg_parallel, atlas_vals=atlas_vals), data))
+        finally:
+            pass
+    else:
+        # serial fallback
+        for d in data:
+            gen_pg_parallel(d, atlas_vals)
 
-    combine_pregrid_chunks(fname_base=fname,
-                           N_chunks=nchunks, N_pregrid=chunksize, N_param=priors.Nparam,
-                           chunk_path=chunk_path, store_path=store_path)
+    print('Generated pregrid (%d chunks, %d sedsperchunk)' % (nchunks, chunksize))
+    print('time taken: %.2f mins.' % ((time.time() - time_start)/60.0))
+
+    combine_pregrid_chunks(
+        fname_base=fname,
+        N_chunks=nchunks,
+        N_pregrid=chunksize,
+        N_param=getattr(priors, "Nparam", 3),
+        chunk_path=chunk_path,
+        store_path=store_path,
+    )
 
     return
 
-def combine_pregrid_chunks(fname_base, N_chunks, N_pregrid, N_param, chunk_path='pregrids/atlaschunks/', store_path='pregrids/'):
+
+# ---------------------------------------------------------------------
+# chunk combiner
+# ---------------------------------------------------------------------
+def _find_chunk_file(chunk_path, fname_base, i):
     """
-    A function to combine chunks of a large pregrid generated in parallel
+    Find a file for chunk i. We try a couple of patterns because the exact suffix
+    (Nparam or #bins) depends on the SFH family.
+    """
+    # most generic: anything that starts with this
+    pattern = os.path.join(chunk_path, f"{fname_base}_chunk_{i}*.dbatlas")
+    matches = glob.glob(pattern)
+    if len(matches) == 0:
+        raise FileNotFoundError(f"Could not find chunk {i} in {chunk_path} with base {fname_base}")
+    # pick the first one (they should all be for this chunk)
+    return matches[0]
+
+
+def combine_pregrid_chunks(
+    fname_base,
+    N_chunks,
+    N_pregrid,
+    N_param,
+    chunk_path='pregrids/atlaschunks/',
+    store_path='pregrids/',
+):
+    """
+    Combine chunks of a large pregrid generated in parallel.
+
+    IMPORTANT: newer pregrids may have variable-length SFH arrays (continuity),
+    so we pad 2D arrays to the widest width we see before stacking.
     """
 
-    i=0
-    atlas_big = db.load_atlas(fname = fname_base+'_chunk_%.0f' %i, N_pregrid = chunksize, N_param = N_param, path=chunk_path)
-    atlas_keys = atlas_big.keys()
+    # load first chunk
+    first_file = _find_chunk_file(chunk_path, fname_base, 0)
+    atlas_big = hickle.load(first_file)
 
-    for i in range(1,N_chunks):
-
-        atlas = db.load_atlas(fname = fname_base+'_chunk_%.0f' %i, N_pregrid = chunksize, N_param = N_param, path=chunk_path)
+    for i in range(1, N_chunks):
+        this_file = _find_chunk_file(chunk_path, fname_base, i)
+        atlas = hickle.load(this_file)
 
         for key in atlas.keys():
+            if key == 'norm_method':
+                continue
 
             try:
-                if key != 'norm_method':
-                    if len(atlas[key].shape) > 1:
-                        cmbd_qty = np.vstack((atlas_big[key],atlas[key]))
+                a_big = atlas_big[key]
+                a_new = atlas[key]
+
+                # 0D / 1D -> hstack
+                if not hasattr(a_big, "shape") or np.ndim(a_big) <= 1:
+                    atlas_big[key] = np.hstack((np.array(a_big), np.array(a_new)))
+                else:
+                    # 2D or higher
+                    if a_big.ndim == 2 and np.ndim(a_new) == 2:
+                        atlas_big[key] = _vstack_pad(a_big, a_new)
                     else:
-                        cmbd_qty = np.hstack((atlas_big[key],atlas[key]))
+                        # fallback — try hstack
+                        atlas_big[key] = np.hstack((a_big, a_new))
+            except Exception as e:
+                print('didnt combine ', key, 'because', e)
 
-                    atlas_big[key] = cmbd_qty
-            except:
-                print('didnt combine ',key)
+    # store combined
+    os.makedirs(store_path, exist_ok=True)
+    totsize = N_pregrid * N_chunks
 
-    fname = fname_base + '_combined'
-
-    totsize = N_pregrid*N_chunks
-    if os.path.exists(store_path):
-        print('Path exists. Saved atlas at : '+store_path+fname+'_'+str(N_pregrid * N_chunks)+'_Nparam_'+str(N_param)+'.dbatlas')
-    else:
-        os.mkdir(store_path)
-        print('Created directory and saved atlas at : '+store_path+fname+'_'+str(N_pregrid * N_chunks)+'_Nparam_'+str(N_param)+'.dbatlas')
+    # we don't know the final "Nparam" in the filename if continuity, so keep what caller gave
+    outname = os.path.join(
+        store_path,
+        f"{fname_base}_combined_{totsize}_Nparam_{N_param}.dbatlas"
+    )
+    print('Saved atlas at : ' + outname)
     try:
-        hickle.dump(atlas_big,
-                    store_path+fname+'_'+str(N_pregrid * N_chunks)+'_Nparam_'+str(N_param)+'.dbatlas',
-                    compression='gzip', compression_opts = 9)
-    except:
+        hickle.dump(atlas_big, outname, compression='gzip', compression_opts=9)
+    except Exception:
         print('storing without compression')
-        hickle.dump(atlas_big,
-                    store_path+fname+'_'+str(N_pregrid * N_chunks)+'_Nparam_'+str(N_param)+'.dbatlas')
+        hickle.dump(atlas_big, outname)
 
     return
 
-# ------------ deprecated -----------------
 
+# ---------------------------------------------------------------------
+# single-galaxy fitter (used by pools)
+# ---------------------------------------------------------------------
+def fit_gals(gal_id, catvals):
+    """
+    Fit a single galaxy SED to an atlas.
+    """
+    if len(catvals) == 3:
+        cat_seds, cat_errs, atlas = catvals
+        fit_mask = []
+    elif len(catvals) == 4:
+        cat_seds, cat_errs, fit_mask, atlas = catvals
+    else:
+        raise ValueError('wrong number of arguments supplied to fitter')
+
+    gal_sed = cat_seds[gal_id, :].copy()
+    gal_err = cat_errs[gal_id, :].copy()
+
+    chi2, norm_fac = evaluate_sed_likelihood(
+        gal_sed,
+        gal_err,
+        atlas,
+        fit_mask=fit_mask,
+        zbest=None,
+        deltaz=None
+    )
+
+    quants = get_quants(chi2, atlas, norm_fac)
+
+    return quants, chi2
+
+
+# ---------------------------------------------------------------------
+# deprecated: redshift-sliced parallel generation
+# ---------------------------------------------------------------------
 def make_atlas_parallel(zval, atlas_params):
     """
     Make a single atlas given a redshift value and a list of parameters (including a priors object).
     Atlas Params: [N_pregrid, priors, fname, store, path, filter_list, filt_dir, z_bw]
     """
-
-    # currently only works for photometry, change to include a variable list of atlas_kwargs
     N_pregrid, priors, fname, store, path, filter_list, filt_dir, z_bw = atlas_params
 
     priors.z_max = zval + z_bw/2
     priors.z_min = zval - z_bw/2
 
-    fname = fname+'_zval_%.0f_' %(zval*10000)
+    fname = fname + '_zval_%.0f_' % (zval * 10000)
 
-    generate_atlas(N_pregrid = N_pregrid,
-                      priors = priors,
-                      fname = fname, store=True, path=path,
-                      filter_list = filter_list, filt_dir = filt_dir,
-                      rseed = int(zval*100000))
+    generate_atlas(
+        N_pregrid=N_pregrid,
+        priors=priors,
+        fname=fname,
+        store=True,
+        path=path,
+        filter_list=filter_list,
+        filt_dir=filt_dir,
+        rseed=int(zval * 100000)
+    )
 
     return
 
 
-def generate_atlas_in_parallel_zgrid(zgrid, atlas_params, dynamic_decouple = True):
+def generate_atlas_in_parallel_zgrid(zgrid, atlas_params, dynamic_decouple=True):
     """
     Make a set of atlases given a redshift grid and a list of parameters (including a priors object).
     Atlas Params: [N_pregrid, priors, fname, store, path, filter_list, filt_dir, z_bw]
@@ -138,66 +274,47 @@ def generate_atlas_in_parallel_zgrid(zgrid, atlas_params, dynamic_decouple = Tru
 
     time_start = time.time()
 
-    try:
-        with MultiPool() as pool:
-            values = list(pool.map(partial(make_atlas_parallel, atlas_params = atlas_params), zgrid))
-    finally:
-        time_end = time.time()
-        print('time taken [parallel]: %.2f min.' %((time_end-time_start)/60))
-
-
-#------------------------------------------------------------------------------------
-
-def fit_gals(gal_id, catvals):
-
-
-    #if not fit_mask:
-    if len(catvals) == 3:
-        cat_seds, cat_errs, atlas = catvals
-        fit_mask = []
-
-    elif len(catvals) == 4:
-        cat_seds, cat_errs, fit_mask, atlas = catvals
-
+    if MultiPool is not None:
+        try:
+            with MultiPool() as pool:
+                list(pool.map(partial(make_atlas_parallel, atlas_params=atlas_params), zgrid))
+        finally:
+            pass
     else:
-        print('wrong number of arguments supplied to fitter')
+        # serial fallback
+        for z in zgrid:
+            make_atlas_parallel(z, atlas_params)
 
-    gal_sed = cat_seds[gal_id, 0:].copy()
-    gal_err = cat_errs[gal_id, 0:].copy()
-    #gal_err = cat_errs[gal_id, 0:].copy() + gal_sed*0.03
-    #gal_err = cat_errs[gal_id, 0:].copy() + gal_sed*0.1
-    #gal_err = cat_errs[gal_id, 0:].copy() + gal_sed*0.5
-    fit_likelihood, fit_norm_fac = evaluate_sed_likelihood(gal_sed,gal_err,atlas,fit_mask=fit_mask,
-                                            zbest=None,deltaz=None)
-
-    quants = get_quants(fit_likelihood, atlas, fit_norm_fac)
-
-    return quants, fit_likelihood
-
-#     try:
-#         map_mstar = evaluate_MAP(atlas['mstar']+np.log10(fit_norm_fac),
-#                                  np.exp(-fit_likelihood/2),
-#                                  bins = np.arange(4,14,0.001),
-#                                  smooth = 'kde', lowess_frac = 0.3, vb = False)
-
-#         map_sfr = evaluate_MAP(atlas['sfr']+np.log10(fit_norm_fac),
-#                                  np.exp(-fit_likelihood/2),
-#                                  bins = np.arange(-6,4,0.001),
-#                                  smooth = 'kde', lowess_frac = 0.3, vb = False)
-#         return quants, fit_likelihood, map_mstar, map_sfr
-#     except:
-#         print('couldnt calculate MAP for galid: ',gal_id)
-#         return quants, fit_likelihood, np.nan, np.nan
+    time_end = time.time()
+    print('time taken [parallel]: %.2f min.' % ((time_end - time_start)/60))
 
 
-
-def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 10000, N_param = 3, z_bw = 0.05, f160_cut = 100, fit_mask = [], zgrid = [], sfr_uncert_cutoff = 2.0):
+# ---------------------------------------------------------------------
+# big catalog fitter (your original logic, slightly tidied)
+# ---------------------------------------------------------------------
+def fit_catalog(
+    fit_cat,
+    atlas_path,
+    atlas_fname,
+    output_fname,
+    N_pregrid=10000,
+    N_param=3,
+    z_bw=0.05,
+    f160_cut=100,
+    fit_mask=[],
+    zgrid=[],
+    sfr_uncert_cutoff=2.0
+):
+    """
+    Fit an entire catalog by slicing in redshift and calling the atlas fitter in parallel.
+    This will work for continuity atlases too, because sed_fitter.get_quants()
+    already branches on atlas['sfh_type'].
+    """
 
     cat_id, cat_zbest, cat_seds, cat_errs, cat_f160, cat_class_star = fit_cat
 
-    #if not zgrid:
-    if isinstance(zgrid, (np.ndarray)) == False:
-        zgrid = np.arange(np.amin(cat_zbest),np.amax(cat_zbest),z_bw)
+    if isinstance(zgrid, np.ndarray) is False:
+        zgrid = np.arange(np.amin(cat_zbest), np.amax(cat_zbest), z_bw)
 
     fit_id = cat_id.copy()
     fit_logM_50 = np.zeros_like(cat_zbest)
@@ -246,40 +363,52 @@ def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 1000
 
         print('loading atlas at', zgrid[i])
 
-        # for a given redshift slice,
         zval = zgrid[i]
 
-        # select the galaxies to be fit
-        z_mask = (cat_zbest < (zval + z_bw/2)) & (cat_zbest > (zval - z_bw/2)) & (cat_f160 < f160_cut)
+        z_mask = (
+            (cat_zbest < (zval + z_bw/2)) &
+            (cat_zbest > (zval - z_bw/2)) &
+            (cat_f160 < f160_cut)
+        )
         fit_ids = np.arange(len(cat_zbest))[z_mask]
 
-
-#         for gal_id in fit_ids:
-
-#             gal_sed = cat_seds[gal_id, 0:]
-#             gal_err = cat_errs[gal_id, 0:]
-
-#             fit_likelihood, fit_norm_fac = evaluate_sed_likelihood(gal_sed,gal_err,atlas,fit_mask=[],
-#                                                 zbest=None,deltaz=None)
-
-#             quants = get_quants(fit_likelihood, atlas, fit_norm_fac)
-
-        print('starting parallel fitting for Ngals = ',len(fit_ids),' at redshift ', str(zval))
+        print('starting parallel fitting for Ngals = ', len(fit_ids), ' at redshift ', str(zval))
 
         try:
-#             load the atlas
-            fname = atlas_fname+'_zval_%.0f_' %(zgrid[i]*10000)
-            atlas = load_atlas(fname, N_pregrid, N_param = N_param, path = atlas_path)
-            print('loaded atlas')
-            with MultiPool() as pool:
-                # note: Parallel doesn't work in Python2.6
+            # load atlas for this redshift slice
+            # original naming convention
+            fname = atlas_fname + '_zval_%.0f_' % (zgrid[i] * 10000)
+            fname_full = os.path.join(
+                atlas_path,
+                f"{fname}{N_pregrid}_Nparam_{N_param}.dbatlas"
+            )
+            if not os.path.exists(fname_full):
+                # try glob, in case continuity changed the suffix
+                pattern = os.path.join(atlas_path, f"{fname}*.dbatlas")
+                matches = glob.glob(pattern)
+                if len(matches) == 0:
+                    raise FileNotFoundError(f"could not find atlas file for z ~ {zgrid[i]}")
+                fname_full = matches[0]
 
-#                 if not fit_mask:
-                if isinstance(fit_mask, np.ndarray) == False:
-                    all_quants = list(pool.map(partial(fit_gals, catvals=(cat_seds, cat_errs, atlas)), fit_ids))
-                else:
-                    all_quants = list(pool.map(partial(fit_gals, catvals=(cat_seds, cat_errs, fit_mask, atlas)), fit_ids))
-            print('finished fitting parallel zbest chunk at z=%.3f' %zval)
+            atlas = hickle.load(fname_full)
+            print('loaded atlas')
+
+            if MultiPool is not None:
+                with MultiPool() as pool:
+                    if isinstance(fit_mask, np.ndarray) is False:
+                        all_quants = list(pool.map(partial(fit_gals, catvals=(cat_seds, cat_errs, atlas)), fit_ids))
+                    else:
+                        all_quants = list(pool.map(partial(fit_gals, catvals=(cat_seds, cat_errs, fit_mask, atlas)), fit_ids))
+            else:
+                # serial
+                all_quants = []
+                for gid in fit_ids:
+                    if isinstance(fit_mask, np.ndarray) is False:
+                        all_quants.append(fit_gals(gid, (cat_seds, cat_errs, atlas)))
+                    else:
+                        all_quants.append(fit_gals(gid, (cat_seds, cat_errs, fit_mask, atlas)))
+
+            print('finished fitting parallel zbest chunk at z=%.3f' % zval)
 
             print('starting to put values in arrays')
             for ii, gal_id in enumerate(fit_ids):
@@ -289,8 +418,6 @@ def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 1000
 
                 quants = all_quants[ii][0]
                 fit_likelihood = all_quants[ii][1]
-    #             fit_logM_MAP[gal_id] = all_quants[ii][2]
-    #             fit_logSFRinst_MAP[gal_id] = all_quants[ii][3]
 
                 fit_logM_50[gal_id] = quants[0][0]
                 fit_logM_16[gal_id] = quants[0][1]
@@ -311,33 +438,37 @@ def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 1000
                 fit_zfit_16[gal_id] = quants[4][1]
                 fit_zfit_84[gal_id] = quants[4][2]
 
+                # quants[5] is the SFH tuple percentiles array — shape (3, ncols)
                 fit_logMt_50[gal_id] = quants[5][0][0]
                 fit_logMt_16[gal_id] = quants[5][1][0]
                 fit_logMt_84[gal_id] = quants[5][2][0]
-                fit_logSFR100_50[gal_id] = quants[5][0][1]
-                fit_logSFR100_16[gal_id] = quants[5][1][1]
-                fit_logSFR100_84[gal_id] = quants[5][2][1]
-                fit_nparam[gal_id] = quants[5][0][2]
-                fit_t25_50[gal_id] = quants[5][0][3]
-                fit_t25_16[gal_id] = quants[5][1][3]
-                fit_t25_84[gal_id] = quants[5][2][3]
-                fit_t50_50[gal_id] = quants[5][0][4]
-                fit_t50_16[gal_id] = quants[5][1][4]
-                fit_t50_84[gal_id] = quants[5][2][4]
-                fit_t75_50[gal_id] = quants[5][0][5]
-                fit_t75_16[gal_id] = quants[5][1][5]
-                fit_t75_84[gal_id] = quants[5][2][5]
 
-                fit_nbands[gal_id] = np.sum(gal_sed>0)
+                # original code assumed gp ordering; keep it for backward compatibility
+                if quants[5].shape[1] > 1:
+                    fit_logSFR100_50[gal_id] = quants[5][0][1]
+                    fit_logSFR100_16[gal_id] = quants[5][1][1]
+                    fit_logSFR100_84[gal_id] = quants[5][2][1]
+                if quants[5].shape[1] > 2:
+                    fit_nparam[gal_id] = quants[5][0][2]
+                if quants[5].shape[1] > 3:
+                    fit_t25_50[gal_id] = quants[5][0][3]
+                    fit_t25_16[gal_id] = quants[5][1][3]
+                    fit_t25_84[gal_id] = quants[5][2][3]
+                if quants[5].shape[1] > 4:
+                    fit_t50_50[gal_id] = quants[5][0][4]
+                    fit_t50_16[gal_id] = quants[5][1][4]
+                    fit_t50_84[gal_id] = quants[5][2][4]
+                if quants[5].shape[1] > 5:
+                    fit_t75_50[gal_id] = quants[5][0][5]
+                    fit_t75_16[gal_id] = quants[5][1][5]
+                    fit_t75_84[gal_id] = quants[5][2][5]
+
+                fit_nbands[gal_id] = np.sum(gal_sed > 0)
                 fit_f160w[gal_id] = cat_f160[gal_id]
                 fit_stellarity[gal_id] = cat_class_star[gal_id]
                 fit_chi2[gal_id] = np.amin(fit_likelihood)
 
-                # flagging galaxies that either
-                # 1. have nan values for mass
-                # 2. have SFR uncertainties > sfr_uncert_cutoff
-                # 3. are flagged as a star
-                # 4. have extremely large chi2
+                # flagging
                 if np.isnan(quants[0][0]):
                     fit_flags[gal_id] = 1.0
                 elif (np.abs(fit_logSFRinst_84[gal_id] - fit_logSFRinst_16[gal_id]) > sfr_uncert_cutoff):
@@ -349,16 +480,15 @@ def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 1000
                 else:
                     fit_flags[gal_id] = 0.0
 
-        except:
-            print('couldn\'t fit with pool at z=',zval)
+        except Exception as e:
+            print("couldn't fit with pool at z=", zval, "because", e)
 
         print('finishing that')
         pl.clf()
         pl.figure(figsize=(12,6))
-        pl.hist(cat_zbest[cat_zbest>0],np.arange(0,6,z_bw),color='black',alpha=0.3)
-        #pl.hist(fit_zfit_50[fit_zfit_50>0],np.arange(0,6,z_bw),color='royalblue')
-        pl.hist(cat_zbest[fit_zfit_50>0],np.arange(0,6,z_bw),color='royalblue')
-        pl.title('fit %.0f/%.0f galaxies' %(np.sum(fit_zfit_50>0), len(cat_zbest)))
+        pl.hist(cat_zbest[cat_zbest>0], np.arange(0,6,z_bw), color='black', alpha=0.3)
+        pl.hist(cat_zbest[fit_zfit_50>0], np.arange(0,6,z_bw), color='royalblue')
+        pl.title('fit %.0f/%.0f galaxies' % (np.sum(fit_zfit_50>0), len(cat_zbest)))
         pl.xlabel('redshift');pl.ylabel('# galaxies')
 
         display.clear_output(wait=True)
@@ -366,29 +496,27 @@ def fit_catalog(fit_cat, atlas_path, atlas_fname, output_fname, N_pregrid = 1000
 
     pl.show()
 
-    #'logSFRinst_MAP':fit_logSFRinst_MAP,
-    #'logM_MAP':fit_logM_MAP,
-
-    fit_mdict = {'ID':fit_id,
-                 'logM_50':fit_logM_50, 'logM_16':fit_logM_16,'logM_84':fit_logM_84,
-                 'logSFRinst_50':fit_logSFRinst_50, 'logSFRinst_16':fit_logSFRinst_16, 'logSFRinst_84':fit_logSFRinst_84,
-                 'logZsol_50':fit_logZsol_50, 'logZsol_16':fit_logZsol_16, 'logZsol_84':fit_logZsol_84,
-                 'Av_50':fit_Av_50, 'Av_16':fit_Av_16, 'Av_84':fit_Av_84,
-                 'zfit_50':fit_zfit_50, 'zfit_16':fit_zfit_16, 'zfit_84':fit_zfit_84,
-                 'logMt_50':fit_logMt_50, 'logMt_16':fit_logMt_16, 'logMt_84':fit_logMt_84,
-                 'logSFR100_50':fit_logSFR100_50, 'logSFR100_16':fit_logSFR100_16, 'logSFR100_84':fit_logSFR100_84,
-                 't25_50':fit_t25_50, 't25_16':fit_t25_16, 't25_84':fit_t25_84,
-                 't50_50':fit_t50_50, 't50_16':fit_t50_16, 't50_84':fit_t50_84,
-                 't75_50':fit_t75_50, 't75_16':fit_t75_16, 't75_84':fit_t75_84,
-                 'nparam':fit_nparam,
-                 'nbands':fit_nbands,
-                 'F160w':fit_f160w,
-                 'stellarity':fit_stellarity,
-                 'chi2': fit_chi2,
-                 'fit_flags':fit_flags}
+    fit_mdict = {
+        'ID':fit_id,
+        'logM_50':fit_logM_50, 'logM_16':fit_logM_16,'logM_84':fit_logM_84,
+        'logSFRinst_50':fit_logSFRinst_50, 'logSFRinst_16':fit_logSFRinst_16, 'logSFRinst_84':fit_logSFRinst_84,
+        'logZsol_50':fit_logZsol_50, 'logZsol_16':fit_logZsol_16, 'logZsol_84':fit_logZsol_84,
+        'Av_50':fit_Av_50, 'Av_16':fit_Av_16, 'Av_84':fit_Av_84,
+        'zfit_50':fit_zfit_50, 'zfit_16':fit_zfit_16, 'zfit_84':fit_zfit_84,
+        'logMt_50':fit_logMt_50, 'logMt_16':fit_logMt_16, 'logMt_84':fit_logMt_84,
+        'logSFR100_50':fit_logSFR100_50, 'logSFR100_16':fit_logSFR100_16, 'logSFR100_84':fit_logSFR100_84,
+        't25_50':fit_t25_50, 't25_16':fit_t25_16, 't25_84':fit_t25_84,
+        't50_50':fit_t50_50, 't50_16':fit_t50_16, 't50_84':fit_t50_84,
+        't75_50':fit_t75_50, 't75_16':fit_t75_16, 't75_84':fit_t75_84,
+        'nparam':fit_nparam,
+        'nbands':fit_nbands,
+        'F160w':fit_f160w,
+        'stellarity':fit_stellarity,
+        'chi2': fit_chi2,
+        'fit_flags':fit_flags
+    }
 
     fit_cat = Table(fit_mdict)
-
     fit_cat.write(output_fname, format='ascii.commented_header')
 
     return
