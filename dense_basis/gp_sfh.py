@@ -226,61 +226,128 @@ def scale_t50_inv(t50_val_frac = 1.0, zval = 1.0):
 # ---------------------------------------------------------------------
 # NEW: continuity SFH helpers
 # ---------------------------------------------------------------------
-def make_continuity_agebins(zred, nbin):
-    """
-    Default continuity binning:
-      split 0 → age(z) into nbin equal-width bins in *lookback* time (Gyr).
-    """
-    t_univ = cosmo.age(zred).value  # Gyr
-    edges = np.linspace(0.0, t_univ, nbin + 1)
-    return np.vstack([edges[:-1], edges[1:]]).T  # (nbin, 2)
+import numpy as np
+from astropy.cosmology import FlatLambdaCDM
+
+# if you already have cosmo defined elsewhere, reuse that
+cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 
 
-def continuity_to_sfh(zred, logmass, log_sfr_ratios, agebins):
+def make_continuity_agebins(zval, nbin=None, bin_edges_fraction=None, cosmo=cosmo):
     """
-    Build a piecewise-constant SFH from:
-      - zred: redshift
-      - logmass: log10 of target formed mass
-      - log_sfr_ratios: array of length (nbin - 1) giving log(SFR_i / SFR_{i-1})
-      - agebins: (nbin, 2) array of lookback time bins in Gyr
+    Build *cosmic-time* bins between 0 and age(z).
+
+    Parameters
+    ----------
+    zval : float
+        redshift
+    nbin : int, optional
+        number of bins (used only if bin_edges_fraction is None)
+    bin_edges_fraction : array-like, optional
+        fractional edges in [0,1], e.g. [0, 0.01, 0.05, 0.1, 0.9, 1.0]
+        will be multiplied by age(z)
 
     Returns
     -------
-    timeax : (N,) Gyr lookback-time axis
-    sfr_t  : (N,) SFR(t) in Msun/yr
-    sfr_bins : (nbin,) SFR per bin in Msun/yr
+    agebins : (nbin, 2) array
+        [[t0_start, t0_end],
+         [t1_start, t1_end],
+         ...
+        ] in Gyr, cosmic time, increasing
     """
-    agebins = np.asarray(agebins, float)
-    nbin = agebins.shape[0]
+    t_univ = cosmo.age(zval).value  # Gyr
+
+    if bin_edges_fraction is not None:
+        edges = np.asarray(bin_edges_fraction, float) * t_univ
+        if not np.all(np.diff(edges) >= 0):
+            raise ValueError("bin_edges_fraction must be non-decreasing")
+    else:
+        if nbin is None:
+            raise ValueError("either nbin or bin_edges_fraction must be provided")
+        edges = np.linspace(0.0, t_univ, nbin + 1)
+
+    # make (nbin, 2)
+    return np.vstack([edges[:-1], edges[1:]]).T
+
+
+def continuity_to_sfh(logmass,
+                      log_sfr_ratios,
+                      zval,
+                      agebins=None,
+                      bin_edges_fraction=None,
+                      cosmo=cosmo,
+                      n_time_fine=300):
+    """
+    Build a piecewise-constant SFH in *cosmic time* for FSPS.
+
+    Parameters
+    ----------
+    logmass : float
+        log10 of total formed mass to reproduce
+    log_sfr_ratios : array, shape (nbin-1,)
+        log10(SFR_i / SFR_{i-1}) for i = 1..nbin-1
+    zval : float
+        redshift; used to get age(z)
+    agebins : (nbin, 2) array, optional
+        cosmic-time bins in Gyr, increasing (0 -> age(z))
+    bin_edges_fraction : array-like, optional
+        alternative to agebins: fractional edges in [0,1] to be stretched to age(z)
+    cosmo : astropy cosmology
+    n_time_fine : int
+        number of points in the returned fine time axis
+
+    Returns
+    -------
+    sfh_fine : (n_time_fine,) array
+        SFR(t) in Msun/yr, cosmic time, increasing
+    time_fine : (n_time_fine,) array
+        cosmic time in Gyr, 0 -> age(z)
+    """
+    # 1. build bins in *cosmic* time
+    if agebins is None:
+        # will raise if neither nbin nor fraction is given
+        # we infer nbin from len(log_sfr_ratios)+1
+        nbin = len(log_sfr_ratios) + 1
+        agebins = make_continuity_agebins(zval,
+                                          nbin=nbin,
+                                          bin_edges_fraction=bin_edges_fraction,
+                                          cosmo=cosmo)
+    else:
+        agebins = np.asarray(agebins, float)
+        nbin = agebins.shape[0]
+
+    # 2. sanity: ratios should be nbin-1
     if len(log_sfr_ratios) != nbin - 1:
-        raise ValueError("length(log_sfr_ratios) must be nbin-1")
+        raise ValueError(f"len(log_sfr_ratios)={len(log_sfr_ratios)} but bins={nbin} (need nbin-1)")
 
-    # start from SFR_0 = 1, then apply ratios
+    # 3. build SFR per bin from ratios (log10)
     sfr_bins = np.zeros(nbin)
-    sfr_bins[0] = 1.0
+    sfr_bins[0] = 1.0  # arbitrary starter
     for i in range(1, nbin):
-        sfr_bins[i] = sfr_bins[i-1] * np.exp(log_sfr_ratios[i-1])
+        sfr_bins[i] = sfr_bins[i - 1] * 10 ** (log_sfr_ratios[i - 1])
 
-    # mass in each bin
+    # 4. convert bin widths -> mass per bin
     widths_yr = (agebins[:, 1] - agebins[:, 0]) * 1e9  # Gyr -> yr
     m_bin = sfr_bins * widths_yr
 
-    # rescale to desired mass
+    # 5. rescale to total formed mass
     target_mass = 10 ** logmass
     m_bin *= target_mass / m_bin.sum()
-    sfr_bins = m_bin / widths_yr
+    sfr_bins = m_bin / widths_yr  # back to Msun/yr
 
-    # make a fine time axis
-    tmin = agebins[0, 0]
-    tmax = agebins[-1, 1]
-    timeax = np.linspace(tmin, tmax, 300)
-    sfr_t = np.zeros_like(timeax)
-    for i, (t0, t1) in enumerate(agebins):
-        mask = (timeax >= t0) & (timeax < t1)
-        sfr_t[mask] = sfr_bins[i]
-    sfr_t[timeax >= agebins[-1, 1]] = sfr_bins[-1]
+    # 6. make a fine *cosmic-time* axis and fill
+    t0 = agebins[0, 0]
+    t1 = agebins[-1, 1]
+    time_fine = np.linspace(t0, t1, n_time_fine)
+    sfh_fine = np.zeros_like(time_fine)
+    for i, (ts, te) in enumerate(agebins):
+        mask = (time_fine >= ts) & (time_fine < te)
+        sfh_fine[mask] = sfr_bins[i]
+    # include the last edge
+    sfh_fine[time_fine >= agebins[-1, 1]] = sfr_bins[-1]
 
-    return timeax, sfr_t, sfr_bins
+    return sfh_fine, time_fine
+
 
 
 
