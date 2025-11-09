@@ -16,7 +16,8 @@ from scipy.optimize import minimize
 from scipy.interpolate import PchipInterpolator, interp1d
 import scipy.io as sio
 
-from .priors import *  # this brings in `cosmo` like in the original repo
+from astropy.cosmology import FlatLambdaCDM #bug fix
+cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 
 import pkg_resources
 
