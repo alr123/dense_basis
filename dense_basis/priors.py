@@ -50,8 +50,8 @@ class Priors(object):
 
         # -------- SFR / sSFR priors --------
         self.sfr_prior_type = 'sSFRflat'  # SFRflat, sSFRflat, sSFRlognormal
-        self.sfr_max = -1.0
-        self.sfr_min = 2.0
+        self.sfr_min = -1.0
+        self.sfr_max = 2.0
         self.ssfr_min = -12.0
         self.ssfr_max = -7.5
         self.ssfr_mean = 0.6
