@@ -2,17 +2,55 @@ import numpy as np
 import matplotlib.pyplot as plt
 import corner
 
-# import seaborn as sns
-
 from pylab import *
 
 from .pre_grid import make_filvalkit_simple, load_atlas
-from .gp_sfh import *
+from .gp_sfh import (
+    tuple_to_sfh,
+    correct_for_mass_loss,
+    fsps_time,
+    fsps_massloss,
+    calctimes,
+    continuity_to_sfh,
+    make_continuity_agebins,
+)
 
+# ---------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------
+def _sfh_from_atlas_row(atlas, idx):
+    """
+    Return (sfh, timeax) for one model in the atlas, no matter which SFH family
+    the atlas was generated with.
+    """
+    sfh_type = atlas.get('sfh_type', 'gp')
+    sfh_tuple = atlas['sfh_tuple'][idx, :]
+    zval = atlas['zval'][idx]
+
+    # drop trailing NaNs from padded array
+    if np.isnan(sfh_tuple).any():
+        sfh_tuple = sfh_tuple[~np.isnan(sfh_tuple)]
+
+    if sfh_type == 'continuity':
+        nbin = int(sfh_tuple[1])
+        agebins = make_continuity_agebins(zval, nbin)
+        log_sfr_ratios = sfh_tuple[2:2 + nbin - 1]
+        timeax, sfh, _ = continuity_to_sfh(
+            zred=zval,
+            logmass=sfh_tuple[0],
+            log_sfr_ratios=log_sfr_ratios,
+            agebins=agebins
+        )
+    else:
+        sfh, timeax = tuple_to_sfh(sfh_tuple, zval)
+
+    return sfh, timeax
+
+
+# ---------------------------------------------------------------------
+# style
+# ---------------------------------------------------------------------
 def set_plot_style():
-    # sns.set(font_scale=2)
-    # sns.set_style('ticks')
-
     rc('axes', linewidth=3)
     rcParams['xtick.major.size'] = 12
     rcParams['ytick.major.size'] = 12
@@ -21,6 +59,10 @@ def set_plot_style():
     rcParams['xtick.major.width'] = 3
     rcParams['ytick.major.width'] = 3
 
+
+# ---------------------------------------------------------------------
+# basic plots
+# ---------------------------------------------------------------------
 def plot_sfh(timeax, sfh, lookback = False, logx = False, logy = False, fig = None, label=None, **kwargs):
     set_plot_style()
 
@@ -42,12 +84,12 @@ def plot_sfh(timeax, sfh, lookback = False, logx = False, logy = False, fig = No
     plt.xlim(0,np.amax(timeax))
     tempy = plt.ylim()
     plt.ylim(0,tempy[1])
-    # plt.show()
     return fig
 
+
 def plot_spec(lam, spec, logx = True, logy = True,
-xlim = (1e2,1e8),
-clip_bottom = True):
+              xlim = (1e2,1e8),
+              clip_bottom = True):
     set_plot_style()
 
     plt.figure(figsize=(12,4))
@@ -62,6 +104,7 @@ clip_bottom = True):
     if clip_bottom == True:
         plt.ylim(1e-3,np.amax(spec)*3)
     plt.show()
+
 
 def plot_filterset(filter_list = 'filter_list_goodss.dat', filt_dir = 'filters/', zval = 1.0, lam_arr = 10**np.linspace(2,8,10000), rest_frame = True):
     set_plot_style()
@@ -79,75 +122,182 @@ def plot_filterset(filter_list = 'filter_list_goodss.dat', filt_dir = 'filters/'
     plt.ylabel('Filter transmission')
     plt.show()
 
+
 def quantile_names(N_params):
     return (np.round(np.linspace(0,100,N_params+2)))[1:-1]
 
+
+# ---------------------------------------------------------------------
+# new-aware: atlas priors
+# ---------------------------------------------------------------------
 def plot_atlas_priors(atlas):
+    """
+    Corner-plot the *atlas* distribution itself.
+    Now supports both gp-style and continuity-style SFHs.
+    """
+    sfh_type = atlas.get('sfh_type', 'gp')
 
     mass_unnormed = np.log10(10**atlas['mstar'] / atlas['norm'])
-    sfr_unnormed = np.log10(10**atlas['sfr'] / atlas['norm'])
+    sfr_unnormed  = np.log10(10**atlas['sfr']  / atlas['norm'])
     ssfr = sfr_unnormed - mass_unnormed
-    txs = atlas['sfh_tuple_rec'][0:,3:]
 
     dust = atlas['dust'].ravel()
-    met = atlas['met'].ravel()
+    met  = atlas['met'].ravel()
     zval = atlas['zval'].ravel()
-    quants = np.vstack((mass_unnormed, sfr_unnormed, ssfr, txs.T, met, dust, zval)).T
 
-    txs = ['t'+'%.0f' %i for i in quantile_names(txs.shape[1])]
-    pg_labels = ['log M*', 'log SFR', 'log sSFR', 'Z', 'Av', 'z']
-    pg_labels[3:3] = txs
+    if sfh_type == 'continuity':
+        # sfh_tuple_rec: [logM_normed, nbin, log_ratio_0, ...] padded with NaNs
+        sfh_tab = atlas['sfh_tuple_rec']
+        # keep only columns that have at least one non-NaN
+        valid_cols = ~np.all(np.isnan(sfh_tab), axis=0)
+        sfh_tab = sfh_tab[:, valid_cols]
 
-    figure = corner.corner(quants,plot_datapoints=False, fill_contours=True,labels=pg_labels,
-                                    bins=20, smooth=1.0,
-                                    quantiles=(0.16, 0.84),
-                                    levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
-                                    label_kwargs={"fontsize": 30})
-    figure.subplots_adjust(right=1.5,top=1.5)
+        # re-expand first column to unnormalized mass
+        sfh_tab[:, 0] = sfh_tab[:, 0] + np.log10(atlas['norm'])
 
+        # build matrix: [logM, logSFR, log sSFR, nbin, ratios..., Z, Av, z]
+        quants = [mass_unnormed, sfr_unnormed, ssfr]
+        for j in range(sfh_tab.shape[1]):
+            quants.append(sfh_tab[:, j])
+        quants.extend([met, dust, zval])
+        quants = np.vstack(quants).T
+
+        labels = ['log M*', 'log SFR', 'log sSFR', 'nbin']
+        # ratios start at col 2 in tuple
+        n_ratios = sfh_tab.shape[1] - 2
+        for k in range(n_ratios):
+            labels.append(f'log SFR ratio {k+1}')
+        labels.extend(['Z', 'Av', 'z'])
+
+    else:
+        # original behavior
+        txs = atlas['sfh_tuple_rec'][:, 3:]
+        quants = np.vstack((mass_unnormed, sfr_unnormed, ssfr, txs.T, met, dust, zval)).T
+
+        tx_names = ['t'+'%.0f' %i for i in quantile_names(txs.shape[1])]
+        labels = ['log M*', 'log SFR', 'log sSFR', 'Z', 'Av', 'z']
+        labels[3:3] = tx_names
+
+    figure = corner.corner(
+        quants,
+        plot_datapoints=False,
+        fill_contours=True,
+        labels=labels,
+        bins=20,
+        smooth=1.0,
+        quantiles=(0.16, 0.84),
+        levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
+        label_kwargs={"fontsize": 30}
+    )
+    figure.subplots_adjust(right=1.5, top=1.5)
     plt.show()
-
     return
 
 
-
+# ---------------------------------------------------------------------
+# new-aware: posterior corner
+# ---------------------------------------------------------------------
 def plot_posteriors(chi2_array, norm_fac, sed, atlas, truths = [], **kwargs):
+    """
+    Corner-plot the *posterior* given chi^2 + atlas.
+    """
     set_plot_style()
 
-    if len(truths) > 0:
-        corner_truths = truths
-#         corner_truths[3:(3+int(sed_truths[2]))] = corner_truths[3:(3+int(sed_truths[2]))]/cosmo.age(corner_truths[-1]).value
-    #pg_params = np.vstack([pg_theta[0][0,0:], pg_theta[0][1,0:], pg_theta[0][3:,0:], pg_theta[1], pg_theta[2], pg_theta[3]])
-    sfrvals = atlas['sfr'].copy()
-    sfrvals[sfrvals<-3] = -3
-    pg_params = np.vstack([atlas['mstar'],sfrvals,atlas['sfh_tuple'][0:,3:].T,atlas['met'].ravel(),atlas['dust'].ravel(),atlas['zval'].ravel()])
-    txs = ['t'+'%.0f' %i for i in quantile_names(pg_params.shape[0]-5)]
-    pg_labels = ['log M*', 'log SFR', 'Z', 'Av', 'z']
-    pg_labels[2:2] = txs
+    sfh_type = atlas.get('sfh_type', 'gp')
 
-    corner_params = pg_params.copy()
-    corner_params[0,0:] += np.log10(norm_fac)
-    corner_params[1,0:] += np.log10(norm_fac)
+    # base arrays
+    mstar = atlas['mstar'] + np.log10(norm_fac)
+    sfr   = atlas['sfr']   + np.log10(norm_fac)
+    met   = atlas['met'].ravel()
+    dust  = atlas['dust'].ravel()
+    zval  = atlas['zval'].ravel()
 
-    if len(truths) > 0:
-        figure = corner.corner(corner_params.T, weights = np.exp(-chi2_array/2),
-                                labels=pg_labels, truths=corner_truths,
-                                plot_datapoints=False, fill_contours=True,
-                                bins=20, smooth=1.0,
-                                quantiles=(0.16, 0.84), levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
-                                label_kwargs={"fontsize": 30}, show_titles=True, **kwargs)
+    if sfh_type == 'continuity':
+        sfh_tab = atlas['sfh_tuple']
+        valid_cols = ~np.all(np.isnan(sfh_tab), axis=0)
+        sfh_tab = sfh_tab[:, valid_cols]
+
+        # col0 is tuple mass → also add norm_fac to show actual mass prior
+        sfh_tab[:, 0] = sfh_tab[:, 0] + np.log10(norm_fac)
+
+        # stack: mstar, sfr, (continuity columns...), Z, Av, z
+        cols = [mstar, sfr]
+        for j in range(sfh_tab.shape[1]):
+            cols.append(sfh_tab[:, j])
+        cols.extend([met, dust, zval])
+        corner_params = np.vstack(cols)
+
+        labels = ['log M*', 'log SFR', 'nbin']
+        n_extra = sfh_tab.shape[1] - 2
+        for k in range(n_extra):
+            labels.append(f'log SFR ratio {k+1}')
+        labels.extend(['Z', 'Av', 'z'])
+
     else:
-        figure = corner.corner(corner_params.T, weights = np.exp(-chi2_array/2),
-                                labels=pg_labels,
-                                plot_datapoints=False, fill_contours=True,
-                                bins=20, smooth=1.0,
-                                quantiles=(0.16, 0.84), levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
-                                label_kwargs={"fontsize": 30}, show_titles=True, **kwargs)
-    figure.subplots_adjust(right=1.5,top=1.5)
+        # gp case, your original
+        txs = atlas['sfh_tuple'][:, 3:].T
+        sfrvals = atlas['sfr'].copy()
+        sfrvals[sfrvals < -3] = -3
+        corner_params = np.vstack([
+            mstar,
+            sfrvals + np.log10(norm_fac),
+            txs,
+            met,
+            dust,
+            zval
+        ])
+
+        tx_names = ['t'+'%.0f' %i for i in quantile_names(corner_params.shape[0]-5)]
+        labels = ['log M*', 'log SFR', 'Z', 'Av', 'z']
+        labels[2:2] = tx_names
+
+    weights = np.exp(-chi2_array/2)
+
+    if len(truths) > 0:
+        figure = corner.corner(
+            corner_params.T,
+            weights=weights,
+            labels=labels,
+            truths=truths,
+            plot_datapoints=False,
+            fill_contours=True,
+            bins=20,
+            smooth=1.0,
+            quantiles=(0.16, 0.84),
+            levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
+            label_kwargs={"fontsize": 30},
+            show_titles=True,
+            **kwargs
+        )
+    else:
+        figure = corner.corner(
+            corner_params.T,
+            weights=weights,
+            labels=labels,
+            plot_datapoints=False,
+            fill_contours=True,
+            bins=20,
+            smooth=1.0,
+            quantiles=(0.16, 0.84),
+            levels=[1 - np.exp(-(1/1)**2/2),1 - np.exp(-(2/1)**2/2)],
+            label_kwargs={"fontsize": 30},
+            show_titles=True,
+            **kwargs
+        )
+
+    figure.subplots_adjust(right=1.5, top=1.5)
     return figure
 
 
+# ---------------------------------------------------------------------
+# prior plotting from file (kept, but note filename pattern)
+# ---------------------------------------------------------------------
 def plot_priors(fname, N_pregrid, N_param, dir = 'pregrids/'):
+    """
+    This is the older helper that expects the pregrid filename pattern.
+    You can make a version that just passes the full path if you’re now saving
+    atlases with continuity-based suffixes.
+    """
     set_plot_style()
 
     cat = load_atlas(fname, N_pregrid, N_param, path = dir)
@@ -175,198 +325,85 @@ def plot_priors(fname, N_pregrid, N_param, dir = 'pregrids/'):
     plt.show()
 
 
+# ---------------------------------------------------------------------
+# SFH posterior (this is the one you’ll most likely want to call)
+# ---------------------------------------------------------------------
 def plot_SFH_posterior(chi2_array, norm_fac, sed, atlas, truths = [], plot_ci = True, sfh_threshold = 0.9, **kwargs):
-    # to be phased out with a newer function
+    """
+    Same idea as your old function, but now supports continuity atlases.
+    """
     set_plot_style()
 
-    #pg_sfhs, pg_Z, pg_Av, pg_z, pg_seds = pg_theta
-    pg_sfhs = atlas['sfh_tuple'].T
-    pg_z = atlas['zval'].ravel()
+    weights = np.exp(-chi2_array/2)
+    order = np.argsort(weights)
 
-    weighted_chi2_indices = np.argsort(np.exp(-chi2_array/2))
-    num_sfhs = np.sum(np.exp(-chi2_array[weighted_chi2_indices]/2) > sfh_threshold*(np.exp(-np.amin(chi2_array)/2)))
+    # choose a common time axis
+    best_idx = order[-1]
+    best_sfh, best_time = _sfh_from_atlas_row(atlas, best_idx)
+    common_time = best_time  # Gyr, forward in time
 
-    temp_sfhs = np.zeros((1000, num_sfhs))
-    temp_times = np.zeros((1000, num_sfhs))
-    rel_likelihoods = np.zeros((num_sfhs,))
-    for i in range(num_sfhs):
-        temp_sfh_tuple = pg_sfhs[0:, weighted_chi2_indices[-(i+1)]].copy()
-        temp_sfh_tuple[0] = temp_sfh_tuple[0] + np.log10(norm_fac)
-        temp_sfh_tuple[1] = temp_sfh_tuple[1] + np.log10(norm_fac)
-        temp_sfhs[0:,i], temp_times[0:,i] = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[weighted_chi2_indices[-(i+1)]])
-        temp_sfhs[0:,i] = np.flip(correct_for_mass_loss(np.flip(temp_sfhs[0:,i],0), temp_times[0:,i], fsps_time, fsps_massloss),0)
+    # pick models above a likelihood threshold
+    max_like = weights[best_idx]
+    keep = weights >= sfh_threshold * max_like
+    kept_indices = np.where(keep)[0]
+    if len(kept_indices) == 0:
+        kept_indices = order[-50:]  # just take top 50
 
-        rel_likelihoods[i] = np.exp(-chi2_array[weighted_chi2_indices[-(i+1)]]/2)
+    gathered = []
+    gathered_w = []
+    for idx in kept_indices:
+        sfh, timeax = _sfh_from_atlas_row(atlas, idx)
+        sfh = sfh * norm_fac
+        sfh_interp = np.interp(common_time, timeax, sfh)
+        gathered.append(sfh_interp)
+        gathered_w.append(weights[idx])
 
-    if plot_ci == False:
-        for i in range(num_sfhs):
-            if i == 0:
-                fig = plot_sfh(temp_times[0:,i], temp_sfhs[0:,i], lookback=True, color='k', alpha=rel_likelihoods[i]**3, **kwargs)
-            else:
-                plot_sfh(temp_times[0:,i], temp_sfhs[0:,i], lookback=True, fig = fig, color='k', alpha=rel_likelihoods[i]**3, **kwargs)
+    gathered = np.array(gathered)
+    gathered_w = np.array(gathered_w)
 
-    if plot_ci == True:
-        _, temp_common_time = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[np.argmin(chi2_array)])
-        temp_sfhs_splined = np.zeros_like(temp_sfhs)
+    if plot_ci:
+        # compute weighted percentiles in log-space
+        sfh_50 = np.zeros_like(common_time)
+        sfh_16 = np.zeros_like(common_time)
+        sfh_84 = np.zeros_like(common_time)
+
+        for ti in range(len(common_time)):
+            this = gathered[:, ti]
+            mask = (this > 0) & np.isfinite(this)
+            if np.sum(mask) == 0:
+                continue
+            vals = np.log10(this[mask])
+            wts = gathered_w[mask]
+
+            # simple weighted CDF
+            bins = 50
+            h, edges = np.histogram(vals, weights=wts, bins=bins)
+            cdf = np.cumsum(h)
+            cdf = cdf / cdf[-1]
+            centers = edges[:-1] + np.diff(edges)/2
+
+            def wp(p):
+                return 10**centers[np.argmin(np.abs(cdf - p))]
+            sfh_50[ti] = wp(0.5)
+            sfh_16[ti] = wp(0.16)
+            sfh_84[ti] = wp(0.84)
+
         fig = plt.figure(figsize=(12,4))
-        for i in range(num_sfhs):
-            temp_sfhs_splined[0:,i] = np.interp(temp_common_time, temp_times[0:,i], np.flip(temp_sfhs[0:,i],0))
-#         plt.fill_between(temp_common_time, np.nanpercentile(temp_sfhs_splined,18,axis=1),
-#                          np.nanpercentile(temp_sfhs_splined,84,axis=1), color='k', alpha=0.1)
-        qt_array = np.arange(25,76,5)
-        for i in range(5):
-            if i == 0:
-                plt.fill_between(temp_common_time, np.nanpercentile(temp_sfhs_splined,qt_array[i],axis=1),
-                                 np.nanpercentile(temp_sfhs_splined,qt_array[-(i+1)],axis=1), color='k', alpha=0.1,
-                                 label='25-75 CI')
-            else:
-                plt.fill_between(temp_common_time, np.nanpercentile(temp_sfhs_splined,qt_array[i],axis=1),
-                                 np.nanpercentile(temp_sfhs_splined,qt_array[-(i+1)],axis=1), color='k', alpha=0.1)
+        plt.plot(np.amax(common_time) - common_time, sfh_50, lw=3, color='k', label='median SFH')
+        plt.fill_between(np.amax(common_time) - common_time, sfh_16, sfh_84, color='k', alpha=0.2)
 
-        plot_sfh(temp_common_time, np.flip(np.nanmedian(temp_sfhs_splined,axis=1),0),
-                       lookback=True, color='k', lw=3, label='median DB-SFH', fig = fig)
-#         print(np.nanpercentile(temp_sfhs_splined,49,axis=1))
+    else:
+        fig = plt.figure(figsize=(12,4))
+        for sfh_interp, wt in zip(gathered, gathered_w):
+            plt.plot(np.amax(common_time) - common_time, sfh_interp, color='k', alpha=0.1 + 0.8*(wt/np.max(gathered_w)))
+
     if len(truths) == 2:
-        plot_sfh(truths[0], truths[1], lookback=True, fig = fig, lw=3,label='true SFH')
-        plt.ylim(0,np.amax(truths[1])*1.5)
-    plt.legend(edgecolor='w', fontsize=18)
+        plot_sfh(truths[0], truths[1], lookback=True, fig=fig, lw=3, label='true SFH')
+        plt.ylim(0, np.amax(truths[1])*1.5)
+
+    plt.xlabel('lookback time [Gyr]')
+    plt.ylabel(r'$SFR(t)$ [M$_\odot$/yr]')
+    plt.legend(edgecolor='w')
     plt.show()
     return
 
-def plot_SFH_posterior_v2(chi2_array, sed, pg_theta, truths = [], plot_ci = True, sfh_threshold = 0.9, Nbins = 30, max_num = 100, npow = 3, **kwargs):
-    set_plot_style()
-
-    pg_sfhs, pg_Z, pg_Av, pg_z, pg_seds = pg_theta
-    weighted_chi2_indices = np.argsort(np.exp(-chi2_array/(2*np.amin(chi2_array))))
-
-    num_sfhs = np.sum(np.exp(-chi2_array/2) > sfh_threshold*(np.exp(-np.amin(chi2_array)/2)))
-    if num_sfhs > max_num:
-        num_sfhs = max_num
-        print('truncated to %.0f SFHs to reduce computation time. increase max_num if desired.' %max_num)
-
-    # to-do: add other norm_facs
-    norm_fac = np.amax(sed)
-
-    temp_sfh_tuple = pg_sfhs[0:, weighted_chi2_indices[-1]].copy()
-    _, temp_common_time = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[np.argmin(chi2_array)])
-
-    temp_sfhs = np.zeros((1000, num_sfhs))
-    temp_sfhs_splined = np.zeros_like(temp_sfhs)
-    temp_times = np.zeros((1000, num_sfhs))
-    rel_likelihoods = np.zeros((num_sfhs,))
-    for i in range(num_sfhs):
-        temp_sfh_tuple = pg_sfhs[0:, weighted_chi2_indices[-(i+1)]].copy()
-        temp_sfh_tuple[0] = temp_sfh_tuple[0] + np.log10(norm_fac)
-        temp_sfh_tuple[1] = temp_sfh_tuple[1] + np.log10(norm_fac)
-        temp_sfhs[0:,i], temp_times[0:,i] = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[weighted_chi2_indices[-(i+1)]])
-        temp_sfhs[0:,i] = np.flip(correct_for_mass_loss(np.flip(temp_sfhs[0:,i],0), temp_times[0:,i], fsps_time, fsps_massloss),0)
-        temp_sfhs_splined[0:,i] = np.interp(temp_common_time, temp_times[0:,i], np.flip(temp_sfhs[0:,i],0))
-        rel_likelihoods[i] = np.exp(-chi2_array[weighted_chi2_indices[-(i+1)]]/(np.amin(chi2_array)*2))
-
-    sfr_range = np.linspace(0, np.nanpercentile(temp_sfhs_splined,99), Nbins+1)
-    sfh_median = np.zeros_like(temp_common_time)
-    sfh_posterior = np.zeros((Nbins, len(temp_common_time) ))
-    for i in range(len(temp_common_time)):
-
-        a,b = np.histogram(temp_sfhs_splined[i,0:], weights= rel_likelihoods**npow, bins = sfr_range, density=True)
-        sfh_posterior[0:,i] = a
-        n_c = np.cumsum(a)
-        n_c = n_c / np.amax(n_c)
-        bin_centers = b[0:-1] + (b[1]-b[0])/2
-        sfh_median[i] = bin_centers[np.argmin(np.abs(n_c - 0.5))]
-
-    fig = plt.figure(figsize=(12,4))
-    plt.pcolor(temp_common_time, sfr_range[0:-1], sfh_posterior,cmap='magma')
-#     clbr = plt.colorbar()
-#     clbr.set_label('P(SFR(t))')
-    plot_sfh(temp_common_time, sfh_median, lookback=False, fig = fig, lw=3,label='median SFH',color='b')
-    if len(truths) == 2:
-        plot_sfh(truths[0], truths[1], lookback=True, fig = fig, lw=3,label='true SFH',color='w')
-        plt.ylim(0,np.amax(truths[1])*1.5)
-    plt.xlim(0,np.amax(temp_common_time))
-    plt.xlabel('t [lookback time; Gyr]')
-    plt.ylabel('SFR(t)')
-    plt.ylim(0,np.amax(sfr_range[0:-1]))
-    l = plt.legend(framealpha=0.0)
-    for text in l.get_texts():
-        text.set_color("white")
-    plt.show()
-
-    return
-
-
-def plot_SFH_posterior_v3(chi2_array, sed, pg_theta, truths = [], plot_ci = True, sfh_threshold = 0.9, Nbins = 30, max_num = 1000, npow = 3, **kwargs):
-    set_plot_style()
-
-    pg_sfhs, pg_Z, pg_Av, pg_z, pg_seds = pg_theta
-    weighted_chi2_indices = np.argsort(np.exp(-chi2_array/(2*np.amin(chi2_array))))
-    Nparam = pg_sfhs.shape[0]-3
-
-    num_sfhs = np.sum(np.exp(-chi2_array/2) > sfh_threshold*(np.exp(-np.amin(chi2_array)/2)))
-    if num_sfhs > max_num:
-        num_sfhs = max_num
-        print('truncated to %.0f SFHs to reduce computation time. increase max_num if desired.' %max_num)
-
-    # to-do: add other norm_facs
-    norm_fac = np.amax(sed)
-
-    temp_sfh_tuple = pg_sfhs[0:, weighted_chi2_indices[-1]].copy()
-    _, temp_common_time = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[np.argmin(chi2_array)])
-
-    temp_sfhs = np.zeros((1000, num_sfhs))
-    temp_sfhs_splined = np.zeros_like(temp_sfhs)
-    temp_times = np.zeros((1000, num_sfhs))
-    rel_likelihoods = np.zeros((num_sfhs,))
-    for i in range(num_sfhs):
-        temp_sfh_tuple = pg_sfhs[0:, weighted_chi2_indices[-(i+1)]].copy()
-        temp_sfh_tuple[0] = temp_sfh_tuple[0] + np.log10(norm_fac)
-        temp_sfh_tuple[1] = temp_sfh_tuple[1] + np.log10(norm_fac)
-        temp_sfhs[0:,i], temp_times[0:,i] = tuple_to_sfh(temp_sfh_tuple, zval = pg_z[weighted_chi2_indices[-(i+1)]])
-        temp_sfhs[0:,i] = np.flip(correct_for_mass_loss(np.flip(temp_sfhs[0:,i],0), temp_times[0:,i], fsps_time, fsps_massloss),0)
-        temp_sfhs_splined[0:,i] = np.interp(temp_common_time, temp_times[0:,i], np.flip(temp_sfhs[0:,i],0))
-        rel_likelihoods[i] = np.exp(-chi2_array[weighted_chi2_indices[-(i+1)]]/(np.amin(chi2_array)*2))
-
-    sfr_range = np.linspace(0, np.nanpercentile(temp_sfhs_splined,99), Nbins+1)
-    sfh_median = np.zeros_like(temp_common_time)
-    sfh_up = np.zeros_like(temp_common_time)
-    sfh_dn = np.zeros_like(temp_common_time)
-    sfh_posterior = np.zeros((Nbins, len(temp_common_time) ))
-    for i in range(len(temp_common_time)):
-        a,b = np.histogram(temp_sfhs_splined[i,0:], weights= rel_likelihoods**npow, bins = sfr_range, density=True)
-        sfh_posterior[0:,i] = a
-        n_c = np.cumsum(a)
-        n_c = n_c / np.amax(n_c)
-        bin_centers = b[0:-1] + (b[1]-b[0])/2
-        sfh_median[i] = bin_centers[np.argmin(np.abs(n_c - 0.5))]
-        sfh_up[i] = bin_centers[np.argmin(np.abs(n_c - 0.16))]
-        sfh_dn[i] = bin_centers[np.argmin(np.abs(n_c - 0.84))]
-
-    a,b,c = calctimes(temp_common_time, np.flip(sfh_median,0), Nparam+3)
-    sfh_median_smooth, time_smooth = tuple_to_sfh(np.hstack([a,b,Nparam+3,c.ravel()]), zval = pg_z[np.argmin(chi2_array)])
-    a,b,c = calctimes(temp_common_time, np.flip(sfh_up,0), Nparam+3)
-    sfh_up_smooth, time_smooth = tuple_to_sfh(np.hstack([a,b,Nparam+3,c.ravel()]), zval = pg_z[np.argmin(chi2_array)])
-    a,b,c = calctimes(temp_common_time, np.flip(sfh_dn,0), Nparam+3)
-    sfh_dn_smooth, time_smooth = tuple_to_sfh(np.hstack([a,b,Nparam+3,c.ravel()]), zval = pg_z[np.argmin(chi2_array)])
-
-    fig = plt.figure(figsize=(12,4))
-#     plt.pcolor(temp_common_time, sfr_range[0:-1], sfh_posterior,cmap='magma')
-#     clbr = plt.colorbar()
-#     clbr.set_label('P(SFR(t))')
-#     db.plot_sfh(temp_common_time, sfh_median, lookback=False, fig = fig, lw=3,label='median SFH')
-    plot_sfh(time_smooth, sfh_median_smooth, lookback=True, color='k', fig = fig, lw=3,label='median SFH')
-    plt.fill_between(np.amax(time_smooth) - time_smooth, sfh_dn_smooth, sfh_up_smooth, color='k',alpha=0.1)
-    #plt.fill_between(temp_common_time, sfh_dn, sfh_up, color='k',alpha=0.1)
-
-    if len(truths) == 2:
-        plot_sfh(truths[0], truths[1], lookback=True, fig = fig, lw=3,label='true SFH')
-        plt.ylim(0,np.amax(truths[1])*1.5)
-    plt.xlim(0,np.amax(temp_common_time))
-    plt.xlabel('t [lookback time; Gyr]')
-    plt.ylabel('SFR(t)')
-    plt.ylim(0,np.amax(sfr_range[0:-1]))
-    l = plt.legend(framealpha=0.0)
-#     for text in l.get_texts():
-#         text.set_color("white")
-    plt.show()
-
-    return
